@@ -31,6 +31,22 @@ python3 conclave.py \
   "Review this plan"
 ```
 
+Include a file or other command output with the task by piping it in. The piped text is added to the task as material to review:
+
+```sh
+cat plan.md | python3 conclave.py "Review this plan"
+git diff | python3 conclave.py "Is this change safe to merge?"
+```
+
+The live dashboard is drawn on stderr, so stdout carries only the final answer. Redirect or pipe it like any other command output, or save it with `--output`:
+
+```sh
+python3 conclave.py "Compare these options" > answer.md
+python3 conclave.py --output answer.md --show-opinions "Compare these options"
+```
+
+`--show-opinions` prints Gemini's and Codex's full replies after Claude's answer. Press Ctrl+C at any time to cancel; Conclave stops the running model CLIs before it exits.
+
 ## Install as a command
 
 ```sh
@@ -52,11 +68,20 @@ gemini = "GEMINI_MODEL_ID"
 openai = "OPENAI_MODEL_ID"
 ```
 
-Flags override the saved model for that run. Leave out a model to use the provider CLI's default. You can use another config path with `--config path/to/config.toml`.
+You can write `codex` instead of `openai`. An unknown provider name in `[models]` is reported as an error, so a typo does not silently fall back to the default model. Flags override the saved model for that run. Leave out a model to use the provider CLI's default. You can use another config path with `--config path/to/config.toml`.
+
+## Run the tests
+
+The tests use stand-in `claude`, `gemini` and `codex` programs, so they need no accounts or network access:
+
+```sh
+pip install -e '.[test]'
+pytest
+```
 
 ## Safety and limits
 
-Claude runs in plan mode, Gemini in plan approval mode, and Codex in a read-only sandbox. Each model call has a 300-second timeout by default; change it with `--timeout`. This version handles one task per invocation and does not keep shared chat history between runs. The terminal inherits the font and background of the app you run it in; its violet accent and panel colors follow Branch HQ.
+Claude runs in plan mode, Gemini in plan approval mode, and Codex in a read-only sandbox. Gemini CLI switches plan mode to its default approval mode in a folder you have not trusted; in non-interactive runs it still cannot edit files or run shell commands without approval. Each model call has a 300-second timeout by default; change it with `--timeout`. When a call times out, Conclave stops that CLI and any processes it started. If an adviser fails, Claude still answers with the opinion it did get and says an adviser was missing. Conclave exits with status 0 when Claude writes the final answer, 1 when it cannot, 2 for a usage or config error, and 130 when cancelled. This version handles one task per invocation and does not keep shared chat history between runs. The terminal inherits the font and background of the app you run it in; its violet accent and panel colors follow Branch HQ.
 
 Install and sign in to Gemini CLI if it is missing:
 
