@@ -7,6 +7,7 @@ AI Council is a command-line interface (CLI): a small program you run from Termi
 ## Requirements
 
 - Python 3.11 or newer
+- Node.js 20 or newer for Gemini CLI
 - Claude Code CLI (`claude`), signed in
 - Gemini CLI (`gemini`), signed in
 - Codex CLI (`codex`), signed in
@@ -38,6 +39,7 @@ aicouncil "Review this plan"
 ```
 
 For a fresh clone, `cd` into the project first. Once its public GitHub repository is published, others can install it directly with `pipx install git+https://github.com/shrestha-droid/ai-council-cli.git`.
+Install pipx for your operating system using the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html).
 
 ## Save model defaults
 
