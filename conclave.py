@@ -25,6 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 
+__version__ = "0.3.0"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
 PROVIDERS = {
     "claude": "claude",
@@ -229,49 +230,19 @@ def read_task(words: list[str], stdin) -> str:
     return task or piped
 
 
-def write_report(final: str, opinions: dict[str, str], show_opinions: bool, output: Path | None) -> None:
-    sections = [("claude", "CLAUDE // FINAL ANSWER", final)] if final else []
-    if show_opinions or not final:
-        sections += [(name, f"{LABELS[name]} // OPINION", opinions[name]) for name in ("gemini", "openai") if name in opinions]
-    if not sections:
-        return
-    # A lone final answer is written as-is; anything more gets a heading per section.
-    text = final if final and len(sections) == 1 else "\n\n".join(f"## {title}\n\n{body}" for _, title, body in sections)
-    if sys.stdout.isatty():
-        out = Console()
-        for name, title, body in sections:
-            out.print(Panel(Markdown(body), title=f"[bold {COLORS[name]}]{title}[/]", border_style=COLORS[name], style="on #0A0C13", padding=(1, 2)))
-    else:
-        sys.stdout.write(text + "\n")
-        sys.stdout.flush()
-    if output:
-        try:
-            output.write_text(text + "\n", encoding="utf-8")
-        except OSError as exc:
-            console.print(f"[bold red]Could not save the answer to {output}:[/] {exc}")
-        else:
-            console.print(f"[dim]Saved to {output}[/]")
+def council(task: str, title: str, selected: dict[str, str | None], timeout: int) -> tuple[str, dict[str, str], list[str]]:
+    """Run one round: Claude briefs, the advisers answer in parallel, Claude synthesizes.
 
-
-def run(args: argparse.Namespace) -> int:
-    try:
-        models = load_models(args.config)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
-
-    selected = {
-        "claude": args.claude_model or models.get("claude"),
-        "gemini": args.gemini_model or models.get("gemini"),
-        "openai": args.openai_model or models.get("openai"),
-    }
-    task = args.task
+    Returns the final answer ("" if Claude could not write one), the advisers' opinions and the advisers that failed.
+    On Ctrl+C the running model calls are stopped before KeyboardInterrupt propagates.
+    """
     states = {
         name: {"status": "waiting", "stage": "standing by", "model": selected[name] or "provider default", "preview": ""}
         for name in PROVIDERS
     }
-    board = Dashboard(states, task)
+    board = Dashboard(states, title)
     opinions: dict[str, str] = {}
+    failed: list[str] = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     try:
         with Live(board, console=console, refresh_per_second=8):
@@ -283,12 +254,12 @@ def run(args: argparse.Namespace) -> int:
                     "they should answer and what evidence or tradeoffs to examine. Do not answer the task yet.\n\n"
                     f"USER TASK:\n{task}",
                     selected["claude"],
-                    args.timeout,
+                    timeout,
                 )
             except RuntimeError as exc:
                 board.finish("claude", "error", "lead unavailable", excerpt(str(exc)))
                 console.print(f"\n[bold red]Claude could not start the review:[/] {exc}")
-                return 1
+                return "", {}, []
 
             board.start("claude", "awaiting adviser opinions")
             board.states["claude"]["preview"] = excerpt(brief)
@@ -300,8 +271,7 @@ def run(args: argparse.Namespace) -> int:
             )
             for name in ("gemini", "openai"):
                 board.start(name, "forming an independent opinion")
-            jobs = {pool.submit(ask, name, adviser_prompt, selected[name], args.timeout): name for name in ("gemini", "openai")}
-            failed = []
+            jobs = {pool.submit(ask, name, adviser_prompt, selected[name], timeout): name for name in ("gemini", "openai")}
             for job in concurrent.futures.as_completed(jobs):
                 name = jobs[job]
                 try:
@@ -328,7 +298,7 @@ def run(args: argparse.Namespace) -> int:
             board.start("claude", "writing the synthesis")
             board.states["claude"]["preview"] = ""
             try:
-                final = ask("claude", final_prompt, selected["claude"], args.timeout)
+                final = ask("claude", final_prompt, selected["claude"], timeout)
             except RuntimeError as exc:
                 board.finish("claude", "error", "synthesis failed", excerpt(str(exc)))
                 console.print(f"\n[bold red]Claude could not synthesize the opinions:[/] {exc}")
@@ -337,24 +307,266 @@ def run(args: argparse.Namespace) -> int:
                 board.finish("claude", "done", "final answer ready", excerpt(final))
     except KeyboardInterrupt:
         stop_all()
-        console.print("\n[bold red]Cancelled.[/] Stopped the running model calls.")
-        return 130
+        raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
     if failed:
         console.print(f"[yellow]Note:[/] {' and '.join(LABELS[name] for name in failed)} did not respond; see the panel above.")
-    write_report(final, {name: opinions[name] for name in opinions if name not in failed}, args.show_opinions, args.output)
+    return final, {name: opinions[name] for name in opinions if name not in failed}, failed
+
+
+def write_report(final: str, opinions: dict[str, str], show_opinions: bool, output: Path | None) -> str:
+    """Print the answer (and opinions when asked), save it to output if given, and return it as Markdown."""
+    sections = [("claude", "CLAUDE // FINAL ANSWER", final)] if final else []
+    if show_opinions or not final:
+        sections += [(name, f"{LABELS[name]} // OPINION", opinions[name]) for name in ("gemini", "openai") if name in opinions]
+    if not sections:
+        return ""
+    # A lone final answer is written as-is; anything more gets a heading per section.
+    text = final if final and len(sections) == 1 else "\n\n".join(f"## {title}\n\n{body}" for _, title, body in sections)
+    if sys.stdout.isatty():
+        out = Console()
+        for name, title, body in sections:
+            out.print(Panel(Markdown(body), title=f"[bold {COLORS[name]}]{title}[/]", border_style=COLORS[name], style="on #0A0C13", padding=(1, 2)))
+    else:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    if output:
+        save(text, output)
+    return text
+
+
+def save(text: str, path: Path) -> None:
+    try:
+        path.expanduser().write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[bold red]Could not save the answer to {path}:[/] {exc}")
+    else:
+        console.print(f"[dim]Saved to {path}[/]")
+
+
+def run(args: argparse.Namespace, selected: dict[str, str | None]) -> int:
+    try:
+        final, opinions, _ = council(args.task, args.task, selected, args.timeout)
+    except KeyboardInterrupt:
+        console.print("\n[bold red]Cancelled.[/] Stopped the running model calls.")
+        return 130
+    write_report(final, opinions, args.show_opinions, args.output)
     return 0 if final else 1
+
+
+# ---------------------------------------------------------------- interactive session
+
+BANNER = (
+    " ██████╗ ██████╗ ███╗   ██╗ ██████╗██╗      █████╗ ██╗   ██╗███████╗",
+    "██╔════╝██╔═══██╗████╗  ██║██╔════╝██║     ██╔══██╗██║   ██║██╔════╝",
+    "██║     ██║   ██║██╔██╗ ██║██║     ██║     ███████║██║   ██║█████╗  ",
+    "██║     ██║   ██║██║╚██╗██║██║     ██║     ██╔══██║╚██╗ ██╔╝██╔══╝  ",
+    "╚██████╗╚██████╔╝██║ ╚████║╚██████╗███████╗██║  ██║ ╚████╔╝ ███████╗",
+    " ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝",
+)
+GRADIENT = ((0xE4, 0xE3, 0xFF), (0xA5, 0xA3, 0xFF), (0x6F, 0x6C, 0xE0))
+MEMORY = 3  # earlier exchanges sent along with a follow-up
+COMMANDS = (
+    ("/model [provider] [name]", "show the council, or set a model (provider: claude, gemini, codex; name: default resets)"),
+    ("/opinions", "toggle printing Gemini's and Codex's full replies"),
+    ("/timeout <seconds>", "change the time allowed per model call"),
+    ("/save <file>", "save the last answer as Markdown"),
+    ("/new", "start fresh: forget earlier answers in this session"),
+    ("/clear", "clear the screen"),
+    ("/help", "show this list"),
+    ("/exit", "leave (Ctrl+D works too)"),
+)
+
+
+def gradient(line: str) -> Text:
+    """Colour a line left to right across the violet gradient."""
+    text = Text()
+    span = max(len(line) - 1, 1)
+    for i, char in enumerate(line):
+        pos = i / span * (len(GRADIENT) - 1)
+        (r1, g1, b1), (r2, g2, b2) = GRADIENT[int(pos)], GRADIENT[min(int(pos) + 1, len(GRADIENT) - 1)]
+        f = pos - int(pos)
+        text.append(char, style=f"bold #{round(r1 + (r2 - r1) * f):02x}{round(g1 + (g2 - g1) * f):02x}{round(b1 + (b2 - b1) * f):02x}")
+    return text
+
+
+class Session:
+    def __init__(self, selected: dict[str, str | None], timeout: int, show_opinions: bool):
+        self.selected = selected
+        self.timeout = timeout
+        self.show_opinions = show_opinions
+        self.history: list[tuple[str, str]] = []
+        self.last_report = ""
+
+    def council_table(self) -> Table:
+        table = Table.grid(padding=(0, 2))
+        for name, role in (("claude", "lead"), ("gemini", "adviser"), ("openai", "adviser")):
+            found = shutil.which(PROVIDERS[name])
+            table.add_row(
+                Text(LABELS[name], style=f"bold {COLORS[name]}"),
+                Text(role, style="dim"),
+                Text(self.selected[name] or "provider default"),
+                Text("✓ ready", style="#8BE9A8") if found else Text(f"✗ {PROVIDERS[name]} not found", style="bold red"),
+            )
+        return table
+
+    def welcome(self) -> None:
+        console.print()
+        if console.size.width >= len(BANNER[0]) + 4:
+            for line in BANNER:
+                console.print(Text("  ") + gradient(line))
+        else:
+            console.print(Text("  ") + gradient("✦  C O N C L A V E  ✦"))
+        console.print(Text(f"  three minds · one answer  ·  v{__version__}", style="dim"))
+        console.print()
+        session = Table.grid(padding=(0, 2))
+        session.add_row(Text("folder", style="dim"), Text(str(Path.cwd()).replace(str(Path.home()), "~", 1)))
+        session.add_row(Text("timeout", style="dim"), Text(f"{self.timeout}s per model call"))
+        session.add_row(Text("opinions", style="dim"), Text("shown" if self.show_opinions else "hidden"))
+        session.add_row(Text("memory", style="dim"), Text(f"follow-ups see the last {MEMORY} answers"))
+        console.print(Panel(
+            Group(self.council_table(), Text(""), session),
+            title="[bold #A5A3FF]THE COUNCIL[/]",
+            title_align="left",
+            border_style="#343746",
+            style="on #0A0C13",
+            padding=(1, 2),
+        ))
+        console.print(Text.assemble(
+            ("  Type a task and press Enter. ", "dim"),
+            ("/help", "bold #A5A3FF"), (" for commands, ", "dim"),
+            ("Ctrl+C", "bold #A5A3FF"), (" cancels a run, ", "dim"),
+            ("/exit", "bold #A5A3FF"), (" leaves.", "dim"),
+        ))
+        console.print()
+
+    def help(self) -> None:
+        table = Table.grid(padding=(0, 3))
+        for command, meaning in COMMANDS:
+            table.add_row(Text(command, style="bold #A5A3FF"), Text(meaning, style="dim"))
+        console.print(Panel(table, title="[bold #A5A3FF]COMMANDS[/]", title_align="left", border_style="#343746", padding=(1, 2)))
+
+    def command(self, line: str) -> bool:
+        """Handle a slash command; return False when the session should end."""
+        name, *rest = line.split()
+        name = name.lower()
+        if name in ("/exit", "/quit", "/q"):
+            return False
+        if name == "/help":
+            self.help()
+        elif name == "/clear":
+            console.clear()
+            self.welcome()
+        elif name == "/new":
+            self.history.clear()
+            console.print("[dim]Started fresh. Earlier answers are forgotten.[/]")
+        elif name == "/opinions":
+            self.show_opinions = not self.show_opinions
+            console.print(f"[dim]Adviser opinions will be {'shown' if self.show_opinions else 'hidden'}.[/]")
+        elif name == "/timeout":
+            if len(rest) != 1 or not rest[0].isdigit() or int(rest[0]) < 1:
+                console.print("[red]Usage:[/] /timeout <seconds>")
+            else:
+                self.timeout = int(rest[0])
+                console.print(f"[dim]Each model call now has {self.timeout}s.[/]")
+        elif name == "/save":
+            if not rest:
+                console.print("[red]Usage:[/] /save <file>")
+            elif not self.last_report:
+                console.print("[dim]Nothing to save yet.[/]")
+            else:
+                save(self.last_report, Path(" ".join(rest)))
+        elif name == "/model":
+            if not rest:
+                console.print(self.council_table())
+            elif len(rest) != 2 or ALIASES.get(rest[0].lower(), rest[0].lower()) not in PROVIDERS:
+                console.print("[red]Usage:[/] /model <claude|gemini|codex> <model name or default>")
+            else:
+                provider = ALIASES.get(rest[0].lower(), rest[0].lower())
+                self.selected[provider] = None if rest[1].lower() == "default" else rest[1]
+                console.print(f"[dim]{LABELS[provider]} now uses {self.selected[provider] or 'the provider default'}.[/]")
+        else:
+            console.print(f"[red]Unknown command {name}.[/] Type /help to see the commands.")
+        return True
+
+    def ask(self, request: str) -> None:
+        task = request
+        if self.history:
+            earlier = "\n\n".join(
+                f"<previous_exchange>\nUSER: {question}\nCONCLAVE ANSWER: {answer[:4000]}\n</previous_exchange>"
+                for question, answer in self.history[-MEMORY:]
+            )
+            task = f"{earlier}\n\nThe exchanges above are context from this session. CURRENT REQUEST:\n{request}"
+        console.print()
+        try:
+            final, opinions, _ = council(task, request, self.selected, self.timeout)
+        except KeyboardInterrupt:
+            console.print("\n[bold red]Cancelled.[/] Stopped the running model calls.")
+            return
+        self.last_report = write_report(final, opinions, self.show_opinions, None) or self.last_report
+        if final:
+            self.history.append((request, final))
+
+
+def prompt_line() -> str:
+    # \001 and \002 tell readline the colour codes take no space, so editing the line stays aligned.
+    return input("\001\x1b[1;38;2;165;163;255m\002❯\001\x1b[0m\002 ")
+
+
+def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bool) -> int:
+    history_file = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "conclave" / "history"
+    try:
+        import readline  # arrow keys, line editing and history; absent on some platforms
+    except ImportError:
+        readline = None
+    if readline:
+        try:
+            readline.read_history_file(history_file)
+        except OSError:
+            pass
+    session = Session(selected, timeout, show_opinions)
+    session.welcome()
+    try:
+        while True:
+            try:
+                line = prompt_line().strip()
+            except KeyboardInterrupt:
+                console.print("\n[dim]Type /exit or press Ctrl+D to leave.[/]")
+                continue
+            except EOFError:
+                console.print()
+                break
+            if not line:
+                continue
+            if line.startswith("/"):
+                if not session.command(line):
+                    break
+            else:
+                session.ask(line)
+                console.print()
+    finally:
+        if readline:
+            try:
+                history_file.parent.mkdir(parents=True, exist_ok=True)
+                readline.set_history_length(1000)
+                readline.write_history_file(history_file)
+            except OSError:
+                pass
+    console.print(Text("  The council is adjourned.", style="dim #A5A3FF"))
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="conclave",
-        description="Claude leads, asks Gemini and OpenAI for opinions, then synthesizes the answer.",
+        description="Claude leads, asks Gemini and OpenAI for opinions, then synthesizes the answer. "
+        "Run it with no task to open an interactive session.",
         epilog=f"Model defaults can be saved in {CONFIG_PATH} under [models]. "
         "Pipe a file to include it with the task: cat plan.md | conclave \"Review this plan\".",
     )
+    parser.add_argument("--version", action="version", version=f"conclave {__version__}")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="model config TOML path")
     parser.add_argument("--claude-model", help="Claude model or alias for both lead stages")
     parser.add_argument("--gemini-model", help="Gemini model for the adviser")
@@ -362,14 +574,31 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=300, help="seconds allowed per model call (default: 300)")
     parser.add_argument("-o", "--output", type=Path, help="also save the answer as Markdown to this file")
     parser.add_argument("--show-opinions", action="store_true", help="print the advisers' full opinions after the answer")
-    parser.add_argument("task", nargs="*", help="the task for Claude and its advisers (or pipe it on stdin)")
+    parser.add_argument("task", nargs="*", help="the task for Claude and its advisers (or pipe it on stdin); "
+                        "leave it out to open an interactive session")
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be at least 1")
     args.task = read_task(args.task, sys.stdin)
-    if not args.task:
+    session = not args.task and sys.stdin.isatty() and sys.stdout.isatty()
+    if not args.task and not session:
         parser.error("give a task as arguments or pipe it on stdin")
-    return run(args)
+    if session and args.output:
+        parser.error("--output needs a task; in an interactive session use /save <file>")
+
+    try:
+        models = load_models(args.config)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    selected = {
+        "claude": args.claude_model or models.get("claude"),
+        "gemini": args.gemini_model or models.get("gemini"),
+        "openai": args.openai_model or models.get("openai"),
+    }
+    if session:
+        return interactive(selected, args.timeout, args.show_opinions)
+    return run(args, selected)
 
 
 if __name__ == "__main__":

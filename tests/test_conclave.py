@@ -1,6 +1,9 @@
 """Tests run Conclave against fake claude, gemini and codex executables placed on PATH."""
 
+import codecs
 import os
+import pty
+import select
 import subprocess
 import sys
 import textwrap
@@ -29,6 +32,8 @@ else:
         notes.append("saw codex")
     if "did not respond" in prompt:
         notes.append("told about missing adviser")
+    if "<previous_exchange>" in prompt:
+        notes.append("saw history")
     print("FINAL ANSWER (" + ", ".join(notes) + ")")
 """
 
@@ -168,3 +173,67 @@ def test_config_rejects_unknown_provider(tmp_path):
     config.write_text('[models]\nclaud = "sonnet"\n')
     with pytest.raises(ValueError, match="Unknown provider 'claud'"):
         conclave.load_models(config)
+
+
+class Terminal:
+    """Drive conclave in a pseudo-terminal, the way a person would."""
+
+    def __init__(self, bin_dir: Path, tmp_path: Path, *args: str):
+        env = dict(
+            os.environ,
+            PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            XDG_CONFIG_HOME=str(tmp_path / "config"),
+            XDG_STATE_HOME=str(tmp_path / "state"),
+            COLUMNS="120",
+            LINES="50",
+            TERM="xterm-256color",
+        )
+        self.fd, child = pty.openpty()
+        self.proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "conclave.py"), *args], stdin=child, stdout=child, stderr=child, env=env, cwd=tmp_path
+        )
+        os.close(child)
+        self.output = ""
+        # Multi-byte characters such as ❯ can be split across reads.
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def expect(self, text: str, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while text not in self.output:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, f"never saw {text!r} in:\n{self.output[-3000:]}"
+            if select.select([self.fd], [], [], remaining)[0]:
+                try:
+                    self.output += self.decoder.decode(os.read(self.fd, 65536))
+                except OSError:
+                    break
+
+    def send(self, line: str) -> None:
+        self.output = ""
+        os.write(self.fd, (line + "\n").encode())
+
+
+@pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
+def test_interactive_session(fake_bin, tmp_path):
+    term = Terminal(fake_bin, tmp_path)
+    term.expect("THE COUNCIL")
+    term.expect("❯")
+    term.send("Pick a database")
+    term.expect("FINAL ANSWER (saw gemini, saw codex)")
+    term.expect("❯")
+    term.send("And for caching?")
+    term.expect("saw history")
+    term.expect("❯")
+    term.send("/model codex gpt-x")
+    term.expect("now uses gpt-x")
+    term.expect("❯")
+    term.send("/save answer.md")
+    term.expect("Saved to answer.md")
+    term.expect("❯")
+    term.send("/bogus")
+    term.expect("Unknown command")
+    term.expect("❯")
+    term.send("/exit")
+    term.expect("adjourned")
+    assert term.proc.wait(timeout=10) == 0
+    assert "saw history" in (tmp_path / "answer.md").read_text()
