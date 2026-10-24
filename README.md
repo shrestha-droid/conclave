@@ -2,6 +2,8 @@
 
 Claude leads the task, asks Gemini and ChatGPT for independent opinions, then writes the final answer. Pick a different model for each provider whenever you like. The terminal dashboard borrows Branch HQ's midnight-and-violet palette, with a distinct live panel for each model.
 
+AI Council is a command-line interface (CLI): a small program you run from Terminal. It does not replace Claude, Gemini or ChatGPT; it coordinates their installed command-line tools for one task.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -35,7 +37,7 @@ pipx install .
 aicouncil "Review this plan"
 ```
 
-For a fresh clone, `cd` into the project first. After the repository is published, others can install directly with `pipx install git+https://github.com/shrestha-droid/ai-council-cli.git`.
+For a fresh clone, `cd` into the project first. Once its public GitHub repository is published, others can install it directly with `pipx install git+https://github.com/shrestha-droid/ai-council-cli.git`.
 
 ## Save model defaults
 
