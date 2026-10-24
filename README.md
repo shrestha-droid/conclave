@@ -1,8 +1,8 @@
-# AI Council CLI
+# Conclave
 
-Claude leads the task, asks Gemini and ChatGPT for independent opinions, then writes the final answer. Pick a different model for each provider whenever you like. The terminal dashboard borrows Branch HQ's midnight-and-violet palette, with a distinct live panel for each model.
+Claude leads the task, asks Gemini and Codex for independent opinions, then writes the final answer. Pick a different model for each provider whenever you like. The terminal dashboard borrows Branch HQ's midnight-and-violet palette, with a distinct live panel for each model.
 
-AI Council is a command-line interface (CLI): a small program you run from Terminal. It does not replace Claude, Gemini or ChatGPT; it coordinates their installed command-line tools for one task.
+Conclave is a command-line interface (CLI): a small program you run from Terminal. It does not replace Claude, Gemini or ChatGPT; it coordinates Claude Code, Gemini CLI and Codex CLI for one task.
 
 ## Requirements
 
@@ -18,13 +18,13 @@ The advisers run in parallel. Claude gets their replies, decides how to weigh th
 ## Run from source
 
 ```sh
-python3 aicouncil.py "Compare these options and recommend one"
+python3 conclave.py "Compare these options and recommend one"
 ```
 
 Override each model for one run:
 
 ```sh
-python3 aicouncil.py \
+python3 conclave.py \
   --claude-model sonnet \
   --gemini-model GEMINI_MODEL_ID \
   --openai-model OPENAI_MODEL_ID \
@@ -35,15 +35,15 @@ python3 aicouncil.py \
 
 ```sh
 pipx install .
-aicouncil "Review this plan"
+conclave "Review this plan"
 ```
 
-For a fresh clone, `cd` into the project first. Once its public GitHub repository is published, others can install it directly with `pipx install git+https://github.com/shrestha-droid/ai-council-cli.git`.
+For a fresh clone, `cd` into the project first. Install the published project directly with `pipx install git+https://github.com/shrestha-droid/ai-council-cli.git`.
 Install pipx for your operating system using the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html).
 
 ## Save model defaults
 
-Create `~/.config/ai-council/config.toml` (or `$XDG_CONFIG_HOME/ai-council/config.toml`):
+Create `~/.config/conclave/config.toml` (or `$XDG_CONFIG_HOME/conclave/config.toml`):
 
 ```toml
 [models]

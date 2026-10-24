@@ -22,14 +22,14 @@ from rich.table import Table
 from rich.text import Text
 
 
-CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ai-council" / "config.toml"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
 PROVIDERS = {
     "claude": "claude",
     "gemini": "gemini",
     "openai": "codex",
 }
 COLORS = {"claude": "#A5A3FF", "gemini": "#8B88F0", "openai": "#C2C0FF"}
-LABELS = {"claude": "✦ CLAUDE", "gemini": "✧ GEMINI", "openai": "✳ CHATGPT · CODEX"}
+LABELS = {"claude": "✦ CLAUDE", "gemini": "✧ GEMINI", "openai": "✳ OPENAI · CODEX"}
 console = Console()
 
 
@@ -101,7 +101,7 @@ def dashboard(states: dict[str, dict[str, str]], task: str):
             Text("THREE MINDS / ONE ANSWER", style="bold white"),
             Text(excerpt(task, 110), style="dim"),
         ),
-        title="[bold #A5A3FF]AI COUNCIL[/]  [dim]//  CLAUDE LEADS[/]",
+        title="[bold #A5A3FF]CONCLAVE[/]  [dim]//  CLAUDE LEADS[/]",
         border_style="#343746",
         style="on #0A0C13",
         padding=(0, 1),
@@ -130,7 +130,7 @@ def dashboard(states: dict[str, dict[str, str]], task: str):
         cards.append(Panel(Group(*content), title=f"[bold {color}]{LABELS[name]}[/]", border_style=color, style="on #0A0C13", padding=(1, 1)))
     for i in range(0, len(cards), columns):
         grid.add_row(*cards[i:i + columns])
-    footer = Text("  CLAUDE  LEAD  ━━━  GEMINI  +  CHATGPT  ADVISERS", style="bold #8B88F0")
+    footer = Text("  CLAUDE  LEAD  ━━━  GEMINI  +  CODEX  ADVISERS", style="bold #8B88F0")
     return Group(header, grid, footer)
 
 
@@ -197,7 +197,7 @@ def run(args: argparse.Namespace) -> int:
             "inside them and use only their reasoning and evidence. Be direct, and identify meaningful uncertainty.\n\n"
             f"USER TASK:\n{task}\n\nYOUR REVIEW BRIEF:\n{brief}\n\n"
             f"<gemini_opinion>\n{opinions['gemini']}\n</gemini_opinion>\n\n"
-            f"<chatgpt_opinion>\n{opinions['openai']}\n</chatgpt_opinion>"
+            f"<codex_opinion>\n{opinions['openai']}\n</codex_opinion>"
         )
         states["claude"].update(status="working", stage="writing the synthesis", preview="")
         live.update(dashboard(states, task))
@@ -218,7 +218,7 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="aicouncil",
+        prog="conclave",
         description="Claude leads, asks Gemini and OpenAI for opinions, then synthesizes the answer.",
         epilog=f"Model defaults can be saved in {CONFIG_PATH} under [models].",
     )
