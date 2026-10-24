@@ -1,11 +1,15 @@
 """Tests run Conclave against fake claude, gemini and codex executables placed on PATH."""
 
 import codecs
+import fcntl
 import os
 import pty
+import re
 import select
+import struct
 import subprocess
 import sys
+import termios
 import textwrap
 import time
 from pathlib import Path
@@ -128,7 +132,21 @@ def test_failed_adviser_is_reported_to_the_lead(fake_bin, tmp_path):
     assert result.returncode == 0, result.stderr
     assert "saw codex" in result.stdout
     assert "told about missing adviser" in result.stdout
-    assert "did not respond" in result.stderr
+    assert "DID NOT RESPOND" in result.stderr
+    assert "Sign in again: run `gemini`" in result.stderr
+
+
+def test_missing_lead_explains_how_to_install(fake_bin, tmp_path):
+    (fake_bin / "claude").unlink()
+    env_path = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep) if not (Path(p) / "claude").exists())
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "conclave.py"), "Pick a database"],
+        input="", capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, PATH=f"{fake_bin}{os.pathsep}{env_path}", XDG_CONFIG_HOME=str(tmp_path / "config")),
+    )
+    assert result.returncode == 1
+    assert "CLAUDE COULDN'T START THE REVIEW" in result.stderr
+    assert "Install Claude Code" in result.stderr
 
 
 def test_output_file_and_opinions(fake_bin, tmp_path):
@@ -175,6 +193,9 @@ def test_config_rejects_unknown_provider(tmp_path):
         conclave.load_models(config)
 
 
+ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[()][0-9A-Za-z]|[=>78])")
+
+
 class Terminal:
     """Drive conclave in a pseudo-terminal, the way a person would."""
 
@@ -187,8 +208,10 @@ class Terminal:
             COLUMNS="120",
             LINES="50",
             TERM="xterm-256color",
+            CONCLAVE_NO_ANIMATION="1",
         )
         self.fd, child = pty.openpty()
+        fcntl.ioctl(child, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 120, 0, 0))
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "conclave.py"), *args], stdin=child, stdout=child, stderr=child, env=env, cwd=tmp_path
         )
@@ -199,30 +222,35 @@ class Terminal:
 
     def expect(self, text: str, timeout: float = 30) -> None:
         deadline = time.monotonic() + timeout
-        while text not in self.output:
+        while text not in ANSI.sub("", self.output):
             remaining = deadline - time.monotonic()
             assert remaining > 0, f"never saw {text!r} in:\n{self.output[-3000:]}"
             if select.select([self.fd], [], [], remaining)[0]:
                 try:
-                    self.output += self.decoder.decode(os.read(self.fd, 65536))
+                    chunk = self.decoder.decode(os.read(self.fd, 65536))
                 except OSError:
                     break
+                # Answer cursor-position requests the way a real terminal does.
+                for _ in range(chunk.count("\x1b[6n")):
+                    os.write(self.fd, b"\x1b[20;1R")
+                self.output += chunk
 
     def send(self, line: str) -> None:
         self.output = ""
-        os.write(self.fd, (line + "\n").encode())
+        os.write(self.fd, (line + "\r").encode())  # Enter sends a carriage return in raw mode
 
 
 @pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
 def test_interactive_session(fake_bin, tmp_path):
     term = Terminal(fake_bin, tmp_path)
     term.expect("THE COUNCIL")
-    term.expect("❯")
+    term.expect("memory 0/3")  # the status bar under the prompt
     term.send("Pick a database")
     term.expect("FINAL ANSWER (saw gemini, saw codex)")
     term.expect("❯")
     term.send("And for caching?")
     term.expect("saw history")
+    term.expect("memory 2/3")
     term.expect("❯")
     term.send("/model codex gpt-x")
     term.expect("now uses gpt-x")

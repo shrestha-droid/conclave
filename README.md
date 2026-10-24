@@ -11,13 +11,15 @@ Conclave is a command-line interface (CLI): a small program you run from Termina
 - Claude Code CLI (`claude`), signed in
 - Gemini CLI (`gemini`), signed in
 - Codex CLI (`codex`), signed in
-- Rich (`pip` installs it with this project)
+- Rich and prompt_toolkit (`pip` and `pipx` install them with this project)
 
 The advisers run in parallel. Claude gets their replies, decides how to weigh them, and returns one answer. While they work, the dashboard shows each model's status and a preview of its opinion. The request and adviser replies are sent to the provider CLIs; their account rules and usage limits apply. Run the command from a project directory when you want the CLIs to have that project as context.
 
 ## Start a session
 
-Type `conclave` on its own to open an interactive session. It shows the council (which model each provider uses and whether its CLI is installed), then waits at a `❯` prompt. Type a task and press Enter; Claude, Gemini and Codex work on it while the dashboard updates, and Claude's answer appears below. Keep typing to ask follow-ups: each one includes your last three answers from the session as context.
+Type `conclave` on its own to open an interactive session. It shows the council (which model each provider uses and whether its CLI is installed, with the install command for any that are missing), then waits at the `✦ conclave ❯` prompt. Type a task and press Enter. A phase tracker moves through Brief, Deliberation and Verdict while each model's card shows what it is doing and for how long, and Claude's verdict appears below with the total time. Keep typing to ask follow-ups: each one includes your last three answers from the session as context.
+
+The status bar under the prompt shows each provider's model, how many earlier answers the next follow-up will carry, whether opinions are shown, and the timeout. Type `/` to see the commands with autocomplete. Earlier tasks appear as grey suggestions; press → to accept one. Alt+Enter (or Esc then Enter) starts a new line, and pasting several lines keeps them together as one task.
 
 ```sh
 conclave
@@ -35,7 +37,7 @@ conclave
 | `/help` | List the commands |
 | `/exit` | Leave (Ctrl+D also works) |
 
-Ctrl+C cancels the task that is running and returns you to the prompt. The up and down arrow keys recall earlier tasks, including ones from previous sessions.
+Ctrl+C cancels the task that is running and returns you to the prompt. The up and down arrow keys recall earlier tasks, including ones from previous sessions. If a model fails, Conclave shows the error with the fix it recognizes, such as the command to sign in again or install a missing CLI. Add `--no-animation` (or set `CONCLAVE_NO_ANIMATION=1`) to skip the start-up animation.
 
 You can still run a single task without opening a session, as below.
 
