@@ -1,8 +1,13 @@
-"""Tests run Conclave against fake claude, gemini and codex executables placed on PATH."""
+"""Tests run Conclave against fake claude, gemini and codex executables placed on PATH.
+
+The fakes speak each CLI's streaming JSON format (Claude's stream-json, Gemini's stream-json, Codex's exec --json).
+"""
 
 import codecs
 import fcntl
+import json
 import os
+import plistlib
 import pty
 import re
 import select
@@ -11,8 +16,11 @@ import subprocess
 import sys
 import termios
 import textwrap
+import threading
 import time
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -20,28 +28,74 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import conclave  # noqa: E402
+import conclave_app  # noqa: E402
+import conclave_context  # noqa: E402
 
 FAKE_CLAUDE = """
-import sys
+import json, os, sys
 prompt = sys.stdin.read()
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+def say(text):
+    emit({"type": "system", "subtype": "init"})
+    emit({"type": "stream_event", "parent_tool_use_id": None, "event": {"type": "message_start", "message": {}}})
+    emit({"type": "stream_event", "parent_tool_use_id": None,
+          "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "name": "Read"}}})
+    for i in range(0, len(text), 7):
+        emit({"type": "stream_event", "parent_tool_use_id": None,
+              "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text[i:i + 7]}}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": text, "total_cost_usd": 0.01,
+          "usage": {"input_tokens": 100, "cache_read_input_tokens": 900, "output_tokens": 50}})
+
+if os.environ.get("CWD_LOG"):
+    open(os.environ["CWD_LOG"], "a").write("claude " + os.getcwd() + "\\n")
 if "Prepare a concise review brief" in prompt:
-    print("BRIEF: weigh cost against speed")
+    say("BRIEF: weigh cost against speed")
 else:
     notes = []
-    if "<input>" in prompt:
-        notes.append("saw piped input")
-    if "GEMINI SAYS" in prompt:
-        notes.append("saw gemini")
-    if "CODEX SAYS" in prompt:
-        notes.append("saw codex")
-    if "did not respond" in prompt:
-        notes.append("told about missing adviser")
-    if "<previous_exchange>" in prompt:
-        notes.append("saw history")
-    print("FINAL ANSWER (" + ", ".join(notes) + ")")
+    for marker, note in (("<input>\\n", "saw piped input"), ("GEMINI SAYS", "saw gemini"), ("CODEX SAYS", "saw codex"),
+                         ("did not respond", "told about missing adviser"), ("<previous_exchange>\\n", "saw history"),
+                         ("<claude_code_conversation>\\n", "saw conversation"), ("<project_state>\\n", "saw project")):
+        if marker in prompt:
+            notes.append(note)
+    say("FINAL ANSWER (" + ", ".join(notes) + ")\\n\\nCOUNCIL: agreement=strong; confidence=high")
 """
 
-FAKE_ADVISER = """
+FAKE_GEMINI = """
+import json, os, sys
+prompt = sys.stdin.read()
+assert "BRIEF: weigh cost against speed" in prompt
+if os.environ.get("CWD_LOG"):
+    open(os.environ["CWD_LOG"], "a").write("gemini " + os.getcwd() + "\\n")
+def emit(event):
+    print(json.dumps(event), flush=True)
+emit({"type": "init", "session_id": "x", "model": "gemini-test"})
+emit({"type": "message", "role": "user", "content": prompt})
+emit({"type": "tool_use", "tool_name": "read_file", "tool_id": "1", "parameters": {}})
+for chunk in ("GEMINI ", "SAYS ", "go"):
+    emit({"type": "message", "role": "assistant", "content": chunk, "delta": True})
+emit({"type": "result", "status": "success", "stats": {"total_tokens": 30, "input_tokens": 20, "output_tokens": 10}})
+"""
+
+FAKE_CODEX = """
+import json, os, sys
+prompt = sys.stdin.read()
+assert "BRIEF: weigh cost against speed" in prompt
+if os.environ.get("CWD_LOG"):
+    open(os.environ["CWD_LOG"], "a").write("codex " + os.getcwd() + "\\n")
+def emit(event):
+    print(json.dumps(event), flush=True)
+emit({"type": "thread.started", "thread_id": "t"})
+emit({"type": "turn.started"})
+emit({"type": "item.completed", "item": {"id": "0", "type": "reasoning", "text": "**Checking the brief**"}})
+emit({"type": "item.started", "item": {"id": "1", "type": "command_execution", "command": "ls", "status": "in_progress"}})
+emit({"type": "item.completed", "item": {"id": "2", "type": "agent_message", "text": "CODEX SAYS go"}})
+emit({"type": "turn.completed", "usage": {"input_tokens": 40, "cached_input_tokens": 0, "output_tokens": 12}})
+"""
+
+FAKE_PLAIN = """
 import sys
 prompt = sys.stdin.read()
 assert "BRIEF: weigh cost against speed" in prompt
@@ -85,27 +139,57 @@ def fake_bin(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     install(bin_dir, "claude", FAKE_CLAUDE)
-    install(bin_dir, "gemini", FAKE_ADVISER.replace("{name}", "GEMINI"))
-    install(bin_dir, "codex", FAKE_ADVISER.replace("{name}", "CODEX"))
+    install(bin_dir, "gemini", FAKE_GEMINI)
+    install(bin_dir, "codex", FAKE_CODEX)
     return bin_dir
 
 
-def run_cli(bin_dir: Path, *args: str, stdin: str = "", tmp_path: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", XDG_CONFIG_HOME=str(tmp_path / "config"))
+def write_conversation(claude_home: Path, project: Path, session: str = "abc12345-0000", *, sidechain_error=False) -> Path:
+    """A small Claude Code transcript: a request, a failing test run, and Claude's reply."""
+    store = claude_home / "projects" / conclave_context.store_name(project)
+    store.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"type": "user", "cwd": str(project), "gitBranch": "main", "message": {"role": "user", "content": "Make the tests pass"}},
+        {"type": "assistant", "cwd": str(project), "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "secret"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest -q"}}]}},
+        {"type": "user", "cwd": str(project), "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "FAILED test_app.py::test_login - KeyError: 'token'"}]}},
+        {"type": "assistant", "cwd": str(project), "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "The login test fails because the token is missing."}]}},
+        {"type": "assistant", "isSidechain": True, "cwd": str(project), "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "SUBAGENT CHATTER"}]}},
+    ]
+    path = store / f"{session}.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\nnot json\n")
+    return path
+
+
+def env_for(bin_dir: Path, tmp_path: Path, **extra) -> dict:
+    return dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", XDG_CONFIG_HOME=str(tmp_path / "config"),
+                XDG_STATE_HOME=str(tmp_path / "state"), CLAUDE_CONFIG_DIR=str(tmp_path / "claude-home"), **extra)
+
+
+def run_cli(bin_dir: Path, *args: str, stdin: str = "", tmp_path: Path, **extra) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(ROOT / "conclave.py"), *args],
         input=stdin,
         capture_output=True,
         text=True,
-        env=env,
+        env=env_for(bin_dir, tmp_path, **extra),
         timeout=60,
+        cwd=tmp_path,
     )
 
+
+# ---------------------------------------------------------------- one-shot runs
 
 def test_answer_goes_to_stdout_when_piped(fake_bin, tmp_path):
     result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"
+    assert result.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"  # the COUNCIL line is not part of the answer
+    assert "agreement strong" in result.stderr
+    assert "confidence high" in result.stderr
 
 
 def test_piped_input_is_added_to_the_task(fake_bin, tmp_path):
@@ -124,6 +208,32 @@ def test_missing_task_is_a_usage_error(fake_bin, tmp_path):
     result = run_cli(fake_bin, tmp_path=tmp_path)
     assert result.returncode == 2
     assert "give a task" in result.stderr
+
+
+def test_plain_text_cli_output_still_works(fake_bin, tmp_path):
+    install(fake_bin, "codex", FAKE_PLAIN.replace("{name}", "CODEX"))
+    result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "saw codex" in result.stdout
+
+
+# A Codex whose JSON events Conclave doesn't recognise, but which answers in plain text without --json.
+FAKE_NEW_FORMAT = """
+import json, sys
+sys.stdin.read()
+if "--json" in sys.argv:
+    print(json.dumps({"type": "session.begin"}))
+    print(json.dumps({"type": "answer.delta", "payload": "CODEX SAYS go"}))
+else:
+    print("CODEX SAYS go")
+"""
+
+
+def test_unreadable_json_falls_back_to_plain_text(fake_bin, tmp_path):
+    install(fake_bin, "codex", FAKE_NEW_FORMAT)
+    result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "saw codex" in result.stdout
 
 
 def test_failed_adviser_is_reported_to_the_lead(fake_bin, tmp_path):
@@ -157,6 +267,7 @@ def test_output_file_and_opinions(fake_bin, tmp_path):
     assert "FINAL ANSWER" in saved
     assert "GEMINI SAYS go" in saved
     assert "CODEX SAYS go" in saved
+    assert "COUNCIL:" not in saved
     assert saved == result.stdout
 
 
@@ -173,12 +284,17 @@ def test_timeout_stops_the_whole_process_group(fake_bin, tmp_path):
     assert not running(child)
 
 
-def test_gemini_prompt_is_sent_on_stdin():
+def test_commands_stream_and_send_prompts_on_stdin():
     command, stdin = conclave.command_for("gemini", "a very long prompt", "gemini-x")
     assert stdin == "a very long prompt"
     assert "a very long prompt" not in command
     assert command[-2:] == ["--model", "gemini-x"]
+    assert "stream-json" in command
+    assert "stream-json" in conclave.command_for("claude", "p", None)[0]
+    assert "--json" in conclave.command_for("openai", "p", None)[0]
 
+
+# ---------------------------------------------------------------- config
 
 def test_config_accepts_codex_alias(tmp_path):
     config = tmp_path / "config.toml"
@@ -193,27 +309,150 @@ def test_config_rejects_unknown_provider(tmp_path):
         conclave.load_models(config)
 
 
+def test_config_theme(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('[ui]\ntheme = "ember"\n')
+    assert conclave.load_config(config) == ({}, "ember")
+    config.write_text('[ui]\ntheme = "plaid"\n')
+    with pytest.raises(ValueError, match="Unknown theme 'plaid'"):
+        conclave.load_config(config)
+
+
+# ---------------------------------------------------------------- stream parsing
+
+def feed(provider: str, events: list) -> conclave.Stream:
+    stream = conclave.Stream(provider)
+    for event in events:
+        stream.feed(json.dumps(event) + "\n" if isinstance(event, dict) else event)
+    return stream
+
+
+def test_claude_stream():
+    delta = lambda text: {"type": "stream_event", "parent_tool_use_id": None,  # noqa: E731
+                          "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}}}
+    stream = feed("claude", [
+        {"type": "stream_event", "parent_tool_use_id": None, "event": {"type": "message_start"}},
+        delta("Let me look"),
+        {"type": "stream_event", "parent_tool_use_id": None, "event": {"type": "message_start"}},  # a new message after a tool
+        delta("The answer"),
+        {"type": "stream_event", "parent_tool_use_id": "sub", "event": {"type": "content_block_delta",
+                                                                         "delta": {"type": "text_delta", "text": "subagent"}}},
+    ])
+    assert stream.live == "The answer"
+    stream.feed(json.dumps({"type": "result", "subtype": "success", "result": "The answer.", "total_cost_usd": 0.5,
+                            "usage": {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3,
+                                      "output_tokens": 4}}))
+    reply = stream.reply("claude", 0, "")
+    assert (reply.text, reply.tokens_in, reply.tokens_out, reply.cost) == ("The answer.", 6, 4, 0.5)
+
+
+def test_claude_stream_error_mentions_sign_in():
+    stream = feed("claude", [{"type": "result", "subtype": "success", "is_error": True,
+                              "result": "Failed to authenticate: OAuth session expired"}])
+    with pytest.raises(RuntimeError, match="OAuth session expired") as error:
+        stream.reply("claude", 1, "")
+    assert conclave.fix_for("claude", str(error.value)).startswith("Sign in again")
+
+
+def test_gemini_stream():
+    stream = feed("gemini", [{"type": "tool_use", "tool_name": "glob"}])
+    assert stream.activity == "using glob"
+    stream = feed("gemini", [{"type": "message", "role": "assistant", "content": "a", "delta": True},
+                             {"type": "message", "role": "assistant", "content": "b", "delta": True},
+                             {"type": "result", "status": "success", "stats": {"input_tokens": 5, "output_tokens": 2}}])
+    assert stream.reply("gemini", 0, "").text == "ab"
+    stream = feed("gemini", [{"type": "result", "status": "error", "error": {"message": "quota exceeded"}}])
+    with pytest.raises(RuntimeError, match="quota exceeded"):
+        stream.reply("gemini", 1, "")
+
+
+def test_codex_stream():
+    stream = feed("openai", [{"type": "error", "message": "Reconnecting... 2/5"},
+                             {"type": "item.completed", "item": {"type": "reasoning", "text": "**Reading the diff**\nmore"}}])
+    assert stream.activity == "reasoning · Reading the diff"
+    stream.feed(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Done."}}))
+    stream.feed(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}}))
+    assert stream.reply("codex", 0, "").text == "Done."
+    failed = feed("openai", [{"type": "turn.failed", "error": {"message": "401 Unauthorized"}}])
+    with pytest.raises(RuntimeError, match="401"):
+        failed.reply("codex", 1, "")
+
+
+def test_agreement_line_is_split_from_the_verdict():
+    body, agreement, confidence = conclave.split_verdict("Use Postgres.\n\n**COUNCIL: agreement=Partial; confidence=low**")
+    assert (body, agreement, confidence) == ("Use Postgres.", "partial", "low")
+    assert conclave.split_verdict("No line here.") == ("No line here.", None, None)
+    assert conclave.drafting("Use Postgres.\nCOUN") == "Use Postgres."
+
+
+# ---------------------------------------------------------------- Claude Code conversations
+
+def test_conversations_are_listed_and_digested(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    project = tmp_path / "shop"
+    project.mkdir()
+    write_conversation(tmp_path / "claude-home", project)
+    (listed,) = conclave_context.conversations(project)
+    assert (listed.title, listed.messages, listed.errors, listed.branch) == ("Make the tests pass", 3, 1, "main")
+    assert conclave_context.projects()[0][0] == str(project)
+    for key in ("latest", "1", "abc1"):
+        assert conclave_context.find(project, key).id == "abc12345-0000"
+    assert conclave_context.find(project, "zzz") is None
+    digest = conclave_context.digest(listed.path)
+    assert "What the user first asked:** Make the tests pass" in digest
+    assert "Errors Claude hit (1" in digest and "KeyError: 'token'" in digest
+    assert "Bash: pytest -q" in digest
+    assert "SUBAGENT CHATTER" not in digest and "secret" not in digest
+
+
+def test_conversation_and_project_reach_the_council(fake_bin, tmp_path):
+    project = tmp_path / "shop"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    write_conversation(tmp_path / "claude-home", project)
+    log = tmp_path / "cwd.log"
+    result = run_cli(fake_bin, "--project", str(project), "--conversation", "latest", "Why do the tests fail?",
+                     tmp_path=tmp_path, CWD_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert "saw conversation" in result.stdout and "saw project" in result.stdout
+    ran_in = {line.split(" ", 1)[1] for line in log.read_text().splitlines()}
+    assert ran_in == {str(project)}  # every model worked inside the project
+
+
+def test_list_conversations_and_handoff(fake_bin, tmp_path):
+    project = tmp_path / "shop"
+    project.mkdir()
+    write_conversation(tmp_path / "claude-home", project)
+    listed = run_cli(fake_bin, "--project", str(project), "--list-conversations", tmp_path=tmp_path)
+    assert listed.returncode == 0 and "Make the tests pass" in listed.stdout and "1 error " in listed.stdout
+    result = run_cli(fake_bin, "-p", str(project), "-c", "1", "--handoff", "Fix it", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    (saved,) = (project / ".conclave").glob("verdict-*.md")
+    assert saved.read_text().startswith("FINAL ANSWER")
+    assert (project / ".conclave" / ".gitignore").read_text() == "*\n"
+    assert "claude --resume abc12345-0000" in re.sub(r"\s+", " ", result.stderr)
+
+
+def test_unknown_conversation_is_a_usage_error(fake_bin, tmp_path):
+    result = run_cli(fake_bin, "-c", "nope", "Fix it", tmp_path=tmp_path)
+    assert result.returncode == 2 and "no Claude Code conversation" in result.stderr
+
+
+# ---------------------------------------------------------------- interactive session
+
 ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[()][0-9A-Za-z]|[=>78])")
 
 
 class Terminal:
     """Drive conclave in a pseudo-terminal, the way a person would."""
 
-    def __init__(self, bin_dir: Path, tmp_path: Path, *args: str):
-        env = dict(
-            os.environ,
-            PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-            XDG_CONFIG_HOME=str(tmp_path / "config"),
-            XDG_STATE_HOME=str(tmp_path / "state"),
-            COLUMNS="120",
-            LINES="50",
-            TERM="xterm-256color",
-            CONCLAVE_NO_ANIMATION="1",
-        )
+    def __init__(self, bin_dir: Path, tmp_path: Path, *args: str, cwd: Path | None = None):
+        env = env_for(bin_dir, tmp_path, COLUMNS="120", LINES="50", TERM="xterm-256color", CONCLAVE_NO_ANIMATION="1")
         self.fd, child = pty.openpty()
         fcntl.ioctl(child, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 120, 0, 0))
         self.proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "conclave.py"), *args], stdin=child, stdout=child, stderr=child, env=env, cwd=tmp_path
+            [sys.executable, str(ROOT / "conclave.py"), *args], stdin=child, stdout=child, stderr=child, env=env,
+            cwd=cwd or tmp_path,
         )
         os.close(child)
         self.output = ""
@@ -224,7 +463,7 @@ class Terminal:
         deadline = time.monotonic() + timeout
         while text not in ANSI.sub("", self.output):
             remaining = deadline - time.monotonic()
-            assert remaining > 0, f"never saw {text!r} in:\n{self.output[-3000:]}"
+            assert remaining > 0, f"never saw {text!r} in:\n{ANSI.sub('', self.output)[-3000:]}"
             if select.select([self.fd], [], [], remaining)[0]:
                 try:
                     chunk = self.decoder.decode(os.read(self.fd, 65536))
@@ -239,29 +478,160 @@ class Terminal:
         self.output = ""
         os.write(self.fd, (line + "\r").encode())  # Enter sends a carriage return in raw mode
 
+    def command(self, line: str, *expected: str) -> None:
+        self.send(line)
+        for text in expected:
+            self.expect(text)
+        self.expect("❯")
+
 
 @pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
 def test_interactive_session(fake_bin, tmp_path):
     term = Terminal(fake_bin, tmp_path)
     term.expect("THE COUNCIL")
     term.expect("memory 0/3")  # the status bar under the prompt
-    term.send("Pick a database")
-    term.expect("FINAL ANSWER (saw gemini, saw codex)")
-    term.expect("❯")
-    term.send("And for caching?")
-    term.expect("saw history")
-    term.expect("memory 2/3")
-    term.expect("❯")
-    term.send("/model codex gpt-x")
-    term.expect("now uses gpt-x")
-    term.expect("❯")
-    term.send("/save answer.md")
-    term.expect("Saved to answer.md")
-    term.expect("❯")
-    term.send("/bogus")
-    term.expect("Unknown command")
-    term.expect("❯")
+    term.command("Pick a database", "FINAL ANSWER (saw gemini, saw codex)", "AGREEMENT")
+    term.command("And for caching?", "saw history", "memory 2/3")
+    term.command("/show gemini", "GEMINI SAYS go")
+    term.command("/model codex gpt-x", "now uses gpt-x")
+    term.command("/theme ember", "Theme: ember")
+    term.command("/stats", "SESSION", "2 strong")
+    term.command("/save answer.md", "Saved to answer.md")
+    term.command("/export session.md", "Saved to session.md")
+    term.command("/bogus", "Unknown command")
     term.send("/exit")
     term.expect("adjourned")
     assert term.proc.wait(timeout=10) == 0
     assert "saw history" in (tmp_path / "answer.md").read_text()
+    transcript = (tmp_path / "session.md").read_text()
+    assert "## 1. Pick a database" in transcript and "## 2. And for caching?" in transcript
+
+
+@pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
+def test_interactive_conversation_and_handoff(fake_bin, tmp_path):
+    project = tmp_path / "shop"
+    project.mkdir()
+    write_conversation(tmp_path / "claude-home", project)
+    term = Terminal(fake_bin, tmp_path, cwd=project)
+    term.expect("This folder has 1 Claude Code conversation")
+    term.expect("❯")
+    term.command("/convos", "Make the tests pass", "1 error")
+    term.command("/attach latest", "Attached")
+    term.command("Why do the tests fail?", "saw conversation")
+    term.command("/handoff", "HAND BACK TO CLAUDE CODE", "claude --resume abc12345-0000")
+    term.command("/retry", "Asking again", "saw conversation")
+    term.command("/detach", "no longer sent")
+    term.send("/exit")
+    term.expect("adjourned")
+    assert list((project / ".conclave").glob("verdict-*.md"))
+
+
+# ---------------------------------------------------------------- the app
+
+@pytest.fixture
+def app_server(fake_bin, tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    app = conclave_app.App({name: None for name in conclave.PROVIDERS}, 30)
+    server = conclave_app.serve(app, 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield app, f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def call(base: str, path: str, token: str | None, body=None, host: str | None = None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Conclave-Token"] = token
+    if host:
+        headers["Host"] = host
+    request = Request(base + path, data=json.dumps(body).encode() if body is not None else None, headers=headers)
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def events(base: str, run_id: str, token: str, until=("done", "cancelled", "failed")):
+    seen = []
+    with urlopen(f"{base}/api/runs/{run_id}/events?token={token}", timeout=30) as response:
+        for raw in response:
+            if raw.startswith(b"data: "):
+                seen.append(json.loads(raw[6:]))
+                if seen[-1]["type"] in until:
+                    return seen
+    return seen
+
+
+def test_app_requires_its_token_and_localhost(app_server):
+    app, base = app_server
+    with urlopen(base + "/", timeout=10) as page:
+        assert app.token in page.read().decode()
+    for token, host in ((None, None), ("wrong", None), (app.token, "evil.example:80")):
+        with pytest.raises(HTTPError) as error:
+            call(base, "/api/info", token, host=host)
+        assert error.value.code == 403
+    info = call(base, "/api/info", app.token)
+    assert info["version"] == conclave.__version__
+    assert all(p["installed"] for p in info["providers"])
+
+
+def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):
+    app, base = app_server
+    project = tmp_path / "shop"
+    project.mkdir()
+    write_conversation(tmp_path / "claude-home", project)
+    assert call(base, "/api/projects", app.token)[0]["path"] == str(project)
+    listed = call(base, f"/api/conversations?project={project}", app.token)
+    assert listed["conversations"][0]["errors"] == 1
+    run = call(base, "/api/runs", app.token, {"question": "Why do the tests fail?", "project": str(project),
+                                               "conversation": "abc12345-0000", "history": [["Earlier?", "Yes."]]})
+    seen = events(base, run["id"], app.token)
+    kinds = [event["type"] for event in seen]
+    assert kinds[-1] == "done" and "stream" in kinds and "tokens" in kinds
+    assert [e["phase"] for e in seen if e["type"] == "phase"] == ["advise", "verdict", "done"]
+    result = seen[-1]["result"]
+    assert "saw conversation" in result["final"] and "saw history" in result["final"]
+    assert (result["agreement"], result["confidence"]) == ("strong", "high")
+    assert result["opinions"]["gemini"] == "GEMINI SAYS go"
+    handed = call(base, f"/api/runs/{run['id']}/handoff", app.token, {})
+    assert Path(handed["path"]).parent == project / ".conclave"
+    assert "--resume abc12345-0000" in handed["command"]
+
+
+def test_app_rejects_bad_requests(app_server):
+    app, base = app_server
+    with pytest.raises(HTTPError) as error:
+        call(base, "/api/runs", app.token, {"question": "  "})
+    assert error.value.code == 400
+    with pytest.raises(HTTPError) as error:
+        call(base, "/api/conversations?project=/no/such/folder", app.token)
+    assert error.value.code == 400
+
+
+def test_app_cancel_stops_the_round(app_server, fake_bin, tmp_path):
+    app, base = app_server
+    pidfile = tmp_path / "child.pid"
+    install(fake_bin, "claude", FAKE_HANG.replace("{pidfile!r}", repr(str(pidfile))))
+    run = call(base, "/api/runs", app.token, {"question": "Hang please"})
+    deadline = time.monotonic() + 10
+    while not pidfile.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    call(base, f"/api/runs/{run['id']}/cancel", app.token, {})
+    seen = events(base, run["id"], app.token)
+    assert seen[-1]["type"] == "cancelled"
+    time.sleep(0.5)
+    assert not running(int(pidfile.read_text()))
+
+
+def test_mac_app_bundle(tmp_path):
+    assert conclave_app.install_mac_app(tmp_path) == 0
+    contents = tmp_path / "Conclave.app" / "Contents"
+    launcher = contents / "MacOS" / "Conclave"
+    assert os.access(launcher, os.X_OK)
+    script = launcher.read_text()
+    assert "export PATH=" in script and "conclave_app.py" in script
+    info = plistlib.loads((contents / "Info.plist").read_bytes())
+    assert info["CFBundleExecutable"] == "Conclave" and info["CFBundleShortVersionString"] == conclave.__version__
+    png = (contents / "Resources" / "Conclave.png").read_bytes()
+    assert png.startswith(b"\x89PNG\r\n\x1a\n") and struct.unpack(">II", png[16:24]) == (512, 512)
