@@ -34,8 +34,14 @@ import conclave_context  # noqa: E402
 FAKE_CLAUDE = """
 import json, os, sys
 from pathlib import Path
-prompt = sys.stdin.read()
 args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("9.9.9 (Claude Code)")
+    sys.exit(0)
+if args[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True}))
+    sys.exit(0)
+prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["claude", *args]) + "\\n")
 # Like the real CLI, a resumed session remembers what was said in it before.
@@ -72,7 +78,8 @@ else:
     notes = []
     for marker, note in (("<input>\\n", "saw piped input"), ("GEMINI SAYS", "saw gemini"), ("CODEX SAYS", "saw codex"),
                          ("did not respond", "told about missing adviser"), ("<previous_exchange>\\n", "saw history"),
-                         ("<claude_code_conversation>\\n", "saw conversation"), ("<project_state>\\n", "saw project")):
+                         ("<claude_code_conversation>\\n", "saw conversation"), ("<project_state>\\n", "saw project"),
+                         ("<gemini_rebuttal>\\n", "saw rebuttals")):
         if marker in seen:
             notes.append(note)
     say("FINAL ANSWER (" + ", ".join(notes) + ")\\n\\nCOUNCIL: agreement=strong; confidence=high")
@@ -80,6 +87,9 @@ else:
 
 FAKE_GEMINI = """
 import json, os, sys
+if sys.argv[1:2] == ["--version"]:
+    print("9.9.9")
+    sys.exit(0)
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["gemini", *sys.argv[1:]]) + "\\n")
@@ -100,6 +110,12 @@ FAKE_CODEX = """
 import json, os, sys
 if sys.argv[1:2] == ["resume"]:  # `codex resume <id>` from /continue
     print("RESUMED " + sys.argv[2])
+    sys.exit(0)
+if sys.argv[1:2] == ["--version"]:
+    print("codex-cli 9.9.9")
+    sys.exit(0)
+if sys.argv[1:3] == ["login", "status"]:
+    print("Logged in using ChatGPT")
     sys.exit(0)
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
@@ -209,7 +225,7 @@ def run_cli(bin_dir: Path, *args: str, stdin: str = "", tmp_path: Path, **extra)
 def test_answer_goes_to_stdout_when_piped(fake_bin, tmp_path):
     result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"  # the COUNCIL line is not part of the answer
+    assert result.stdout == "FINAL ANSWER (saw gemini, saw codex, saw rebuttals)\n"  # the COUNCIL line is not part of the answer
     assert "agreement strong" in result.stderr
     assert "confidence high" in result.stderr
 
@@ -333,7 +349,7 @@ def test_rounds_are_saved_as_sessions_in_each_tool(fake_bin, tmp_path):
     result = run_cli(fake_bin, "Pick a database", stdin="the schema", tmp_path=tmp_path, ARGV_LOG=str(log))
     assert result.returncode == 0, result.stderr
     # The verdict comes from a resumed session that already holds the task, and still sees everything.
-    assert result.stdout == "FINAL ANSWER (saw piped input, saw gemini, saw codex)\n"
+    assert result.stdout == "FINAL ANSWER (saw piped input, saw gemini, saw codex, saw rebuttals)\n"
     calls = argv_log(log)
     brief, verdict = calls["claude"]
     lead = brief[brief.index("--session-id") + 1]
@@ -356,11 +372,48 @@ def test_private_runs_leave_no_sessions(fake_bin, tmp_path):
         (tmp_path / "config" / "conclave" / "config.toml").write_text(config)
         result = run_cli(fake_bin, *args, "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"
+        assert result.stdout == "FINAL ANSWER (saw gemini, saw codex, saw rebuttals)\n"
         calls = argv_log(log)
         assert all("--no-session-persistence" in call for call in calls["claude"])
         assert "--session-id" not in calls["gemini"][0] and "--ephemeral" in calls["codex"][0]
         assert "continue in" not in result.stderr
+
+
+def test_advisers_cross_examine_each_other(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "--show-opinions", "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    calls = argv_log(log)
+    assert len(calls["gemini"]) == 2 and len(calls["codex"]) == 2  # an opinion, then a rebuttal
+    assert "After reading the other adviser" in result.stdout
+    quick = run_cli(fake_bin, "--quick", "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert quick.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"
+
+
+def test_no_cross_examination_when_an_adviser_fails(fake_bin, tmp_path):
+    install(fake_bin, "gemini", FAKE_FAILURE)
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert "saw rebuttals" not in result.stdout and len(argv_log(log)["codex"]) == 1
+
+
+def test_setup_reports_each_tool(fake_bin, tmp_path):
+    result = run_cli(fake_bin, "--setup", tmp_path=tmp_path, GEMINI_API_KEY="x")
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("ready") == 3 and "9.9.9 (Claude Code)" in result.stderr
+    (fake_bin / "gemini").unlink()
+    env_path = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep) if not (Path(p) / "gemini").exists())
+    missing = subprocess.run([sys.executable, str(ROOT / "conclave.py"), "--setup"], capture_output=True, text=True,
+                             timeout=60, env=dict(env_for(fake_bin, tmp_path), PATH=f"{fake_bin}{os.pathsep}{env_path}"))
+    assert missing.returncode == 1
+    assert "not installed" in missing.stderr and "npm install -g @google/gemini-cli" in missing.stderr
+
+
+def test_shell_command_detection():
+    assert conclave.looks_like_shell("npm install -g @google/gemini-cli")
+    assert conclave.looks_like_shell("git status")
+    assert not conclave.looks_like_shell("git rebase or merge, which is safer here?")
+    assert not conclave.looks_like_shell("Why does the build keep failing")
 
 
 def test_commands_stream_and_send_prompts_on_stdin():
@@ -572,7 +625,7 @@ def test_interactive_session(fake_bin, tmp_path):
     term = Terminal(fake_bin, tmp_path)
     term.expect("THE COUNCIL")
     term.expect("memory 0/3")  # the status bar under the prompt
-    term.command("Pick a database", "FINAL ANSWER (saw gemini, saw codex)", "AGREEMENT")
+    term.command("Pick a database", "FINAL ANSWER (saw gemini, saw codex, saw rebuttals)", "AGREEMENT")
     term.command("And for caching?", "saw history", "memory 2/3")
     term.command("/show gemini", "GEMINI SAYS go")
     term.command("/continue codex", "Opening Codex", "RESUMED codex-thread-1")
@@ -589,6 +642,23 @@ def test_interactive_session(fake_bin, tmp_path):
     assert "saw history" in (tmp_path / "answer.md").read_text()
     transcript = (tmp_path / "session.md").read_text()
     assert "## 1. Pick a database" in transcript and "## 2. And for caching?" in transcript
+
+
+@pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
+def test_interactive_shell_commands(fake_bin, tmp_path):
+    (tmp_path / "sub").mkdir()
+    term = Terminal(fake_bin, tmp_path)
+    term.expect("memory 0/3")
+    term.command("!echo hello-from-the-shell", "hello-from-the-shell")
+    term.send("echo detected-command")
+    term.expect("looks like a shell command")
+    os.write(term.fd, b"y")
+    term.expect("detected-command")
+    term.expect("❯")
+    term.command("!cd sub", "Now in")
+    term.command("!pwd", str(tmp_path / "sub"))
+    term.send("/exit")
+    term.expect("adjourned")
 
 
 @pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
@@ -672,11 +742,11 @@ def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):
     seen = events(base, run["id"], app.token)
     kinds = [event["type"] for event in seen]
     assert kinds[-1] == "done" and "stream" in kinds and "tokens" in kinds
-    assert [e["phase"] for e in seen if e["type"] == "phase"] == ["advise", "verdict", "done"]
+    assert [e["phase"] for e in seen if e["type"] == "phase"] == ["advise", "cross", "verdict", "done"]
     result = seen[-1]["result"]
     assert "saw conversation" in result["final"] and "saw history" in result["final"]
     assert (result["agreement"], result["confidence"]) == ("strong", "high")
-    assert result["opinions"]["gemini"] == "GEMINI SAYS go"
+    assert result["opinions"]["gemini"].startswith("GEMINI SAYS go") and "After reading the other adviser" in result["opinions"]["gemini"]
     assert set(result["sessions"]) == {"claude", "gemini", "openai"}
     resumed = call(base, f"/api/runs/{run['id']}/continue", app.token, {"provider": "codex"})
     assert resumed["command"].endswith("codex resume codex-thread-1")

@@ -36,7 +36,7 @@ from rich.text import Text
 import conclave_context
 
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
 PROVIDERS = {
     "claude": "claude",
@@ -115,6 +115,7 @@ class Settings:
     models: dict[str, str] = field(default_factory=dict)
     theme: str | None = None
     save_sessions: bool = True  # keep each round as a resumable session in Claude Code, Gemini CLI and Codex
+    cross_examine: bool = True  # advisers critique each other's opinions before the verdict
 
 
 def load_config(path: Path) -> Settings:
@@ -146,7 +147,10 @@ def load_config(path: Path) -> Settings:
     sessions = data.get("sessions", {})
     if not isinstance(sessions, dict) or not isinstance(sessions.get("save", True), bool):
         raise ValueError(f"[sessions] in {path} must be a table with save = true or false")
-    return Settings(selected, theme, sessions.get("save", True))
+    council = data.get("council", {})
+    if not isinstance(council, dict) or not isinstance(council.get("cross_examine", True), bool):
+        raise ValueError(f"[council] in {path} must be a table with cross_examine = true or false")
+    return Settings(selected, theme, sessions.get("save", True), council.get("cross_examine", True))
 
 
 def load_models(path: Path) -> dict[str, str]:
@@ -528,7 +532,11 @@ def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch,
 
 ROLES = {"claude": "LEAD", "gemini": "ADVISER", "openai": "ADVISER"}
 MEMORY = 3  # earlier exchanges sent along with a follow-up
-PHASES = (("brief", "BRIEF"), ("advise", "DELIBERATION"), ("verdict", "VERDICT"))
+PHASES = (("brief", "BRIEF"), ("advise", "DELIBERATION"), ("cross", "CROSS-EXAM"), ("verdict", "VERDICT"))
+
+
+def phases_for(cross_examine: bool) -> tuple[tuple[str, str], ...]:
+    return PHASES if cross_examine else tuple(p for p in PHASES if p[0] != "cross")
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ANIMATE = True  # start-up effects; main() turns them off for --no-animation, CONCLAVE_NO_ANIMATION or a non-terminal
 
@@ -606,7 +614,8 @@ def banner_line(line: str, sweep: float | None = None) -> Text:
         elif char == " ":
             text.append(" ")
         else:
-            text.append(char, style=blend(color, INK, 0.45))
+            # The box-drawing shadow becomes a solid darker cell: thin line glyphs look like a grid in some fonts.
+            text.append(" ", style=f"on {blend(color, INK, 0.72)}")
     return text
 
 
@@ -739,7 +748,8 @@ class Dashboard:
     finish(), tokens() and done(); it is re-rendered on every Live refresh, so pulses, comets, streaming text
     and clocks keep moving between reports."""
 
-    def __init__(self, selected: dict[str, str | None], task: str):
+    def __init__(self, selected: dict[str, str | None], task: str, cross_examine: bool = False):
+        self.phases = phases_for(cross_examine)
         self.states = {
             name: {"status": "waiting", "stage": "standing by", "model": selected[name] or "default", "preview": ""}
             for name in PROVIDERS
@@ -775,10 +785,10 @@ class Dashboard:
         return update
 
     def tracker(self) -> Text:
-        order = [key for key, _ in PHASES]
+        order = [key for key, _ in self.phases]
         current = order.index(self.phase) if self.phase in order else len(order)
         text = Text()
-        for i, (_, label) in enumerate(PHASES):
+        for i, (_, label) in enumerate(self.phases):
             if i:
                 text.append("  ──────  ", style=ACCENT if i <= current else EDGE)
             if i < current:
@@ -908,6 +918,14 @@ class Round:
     seconds: float = 0.0
     errors: list[tuple[str, str, str]] = field(default_factory=list)  # (provider, headline, message)
     sessions: dict[str, str] = field(default_factory=dict)  # provider -> command that continues its saved session
+    rebuttals: dict[str, str] = field(default_factory=dict)  # provider -> its critique of the other adviser
+
+    def opinion(self, name: str) -> str:
+        """An adviser's opinion, followed by its cross-examination of the other adviser when there was one."""
+        text = self.opinions.get(name, "")
+        if text and name in self.rebuttals:
+            text += f"\n\n---\n\n**After reading the other adviser:**\n\n{self.rebuttals[name]}"
+        return text
 
     def add(self, reply: Reply) -> None:
         self.tokens_in += reply.tokens_in
@@ -971,12 +989,13 @@ def compose(request: str, project: Path | None = None, conversation=None, histor
 
 def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
                cwd: Path | str | None = None, control: Control | None = None,
-               title: str = "", save_sessions: bool = False) -> Round:
+               title: str = "", save_sessions: bool = False, cross_examine: bool = False) -> Round:
     """Run one round: Claude briefs, the advisers answer in parallel, Claude writes the verdict.
 
     `view` receives progress (see Dashboard). Model failures are collected in Round.errors rather than raised;
     Cancelled and KeyboardInterrupt propagate. With save_sessions, Claude's brief and verdict share one named
     Claude Code session and each adviser's call is kept in its own tool, so any of them can be continued there.
+    With cross_examine, once both opinions are in, each adviser critiques the other's before Claude decides.
     """
     result = Round(task)
     started = time.monotonic()
@@ -1034,6 +1053,37 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
                 result.opinions[name] = reply.text
                 view.finish(name, "done", "opinion delivered", preview(reply.text))
 
+        if cross_examine and not result.failed:
+            view.set_phase("cross")
+            view.start("claude", "hearing the cross-examination", "waiting for both rebuttals", preview(result.brief))
+            other = {"gemini": "openai", "openai": "gemini"}
+
+            def rebuttal_prompt(name: str) -> str:
+                return (
+                    "You are an independent adviser on a review panel. Below are your earlier opinion and another "
+                    "adviser's opinion on the same task. Say where the other adviser is wrong, unsupported or missing "
+                    "something, check disputed claims against the files when you can, and say whether anything changes "
+                    f"your view. Be brief and concrete. {MATERIAL}\n\n"
+                    f"USER TASK:\n{task}\n\n<lead_brief>\n{result.brief}\n</lead_brief>\n\n"
+                    f"<your_opinion>\n{result.opinions[name]}\n</your_opinion>\n\n"
+                    f"<other_adviser_opinion>\n{result.opinions[other[name]]}\n</other_adviser_opinion>"
+                )
+
+            for name in other:
+                view.start(name, "cross-examining")
+            jobs = {pool.submit(call, name, rebuttal_prompt(name)): name for name in other}
+            for job in concurrent.futures.as_completed(jobs):
+                name = jobs[job]
+                try:
+                    reply = job.result()
+                except RuntimeError:
+                    # The first opinion still stands; a missing rebuttal only means less for Claude to weigh.
+                    view.finish(name, "done", "kept its opinion (no rebuttal)", preview(result.opinions[name]))
+                else:
+                    tally(name, reply)
+                    result.rebuttals[name] = reply.text
+                    view.finish(name, "done", "rebuttal delivered", preview(reply.text))
+
         note = ""
         if len(result.failed) == 2:
             note = "Neither adviser responded. Answer on your own judgment and tell the user the advisers were unavailable.\n\n"
@@ -1053,6 +1103,10 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
                else f"USER TASK:\n{task}\n\nYOUR REVIEW BRIEF:\n{result.brief}\n\n")
             + f"<gemini_opinion>\n{result.opinions['gemini']}\n</gemini_opinion>\n\n"
             f"<codex_opinion>\n{result.opinions['openai']}\n</codex_opinion>"
+            + ("\n\nEach adviser then cross-examined the other. Weigh these rebuttals, especially where they "
+               "correct a claim:\n\n" if result.rebuttals else "")
+            + "".join(f"<{tag}_rebuttal>\n{result.rebuttals[name]}\n</{tag}_rebuttal>\n\n"
+                      for name, tag in (("gemini", "gemini"), ("openai", "codex")) if name in result.rebuttals)
         )
         view.set_phase("verdict")
         view.start("claude", "writing the verdict")
@@ -1076,13 +1130,14 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
 
 
 def council(task: str, title: str, selected: dict[str, str | None], timeout: int, cwd: Path | None = None,
-            save_sessions: bool = False) -> Round:
+            save_sessions: bool = False, cross_examine: bool = False) -> Round:
     """A round in the terminal, with the live dashboard. On Ctrl+C the model calls are stopped and KeyboardInterrupt
     propagates."""
-    board = Dashboard(selected, title)
+    board = Dashboard(selected, title, cross_examine)
     try:
         with Live(board, console=console, refresh_per_second=12):
-            result = deliberate(task, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions)
+            result = deliberate(task, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions,
+                                cross_examine=cross_examine)
     except KeyboardInterrupt:
         stop_all()
         raise
@@ -1105,7 +1160,7 @@ def write_report(result: Round, show_opinions: bool, output: Path | None) -> str
     """Print the verdict (and opinions when asked), save it to output if given, and return it as Markdown."""
     sections = [("claude", "✦ VERDICT", result.final)] if result.final else []
     if show_opinions or not result.final:
-        sections += [(name, f"{LABELS[name]} · OPINION", result.opinions[name])
+        sections += [(name, f"{LABELS[name]} · OPINION", result.opinion(name))
                      for name in ("gemini", "openai") if name in result.opinions]
     if not sections:
         return ""
@@ -1185,7 +1240,7 @@ def save(text: str, path: Path) -> None:
 def run(args: argparse.Namespace, selected: dict[str, str | None], project: Path | None, conversation) -> int:
     try:
         result = council(compose(args.task, project, conversation), args.title, selected, args.timeout, cwd=project,
-                         save_sessions=args.save_sessions)
+                         save_sessions=args.save_sessions, cross_examine=args.cross_examine)
     except KeyboardInterrupt:
         console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
         return 130
@@ -1226,6 +1281,139 @@ def hand_back(project: Path, conversation, verdict: str) -> None:
     ))
 
 
+# ---------------------------------------------------------------- setup: are the three tools installed and signed in?
+
+INSTALL_COMMANDS = {
+    "claude": "npm install -g @anthropic-ai/claude-code",
+    "gemini": "npm install -g @google/gemini-cli",
+    "openai": "npm install -g @openai/codex@latest",
+}
+SIGN_IN_COMMANDS = {"claude": "claude auth login", "gemini": "gemini", "openai": "codex login"}
+
+
+@dataclass
+class Health:
+    provider: str
+    installed: bool
+    version: str = ""
+    signed_in: bool | None = None  # None: couldn't tell
+    detail: str = ""
+
+
+def quiet(command: list[str], timeout: int = 20) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                              encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def gemini_signed_in() -> bool:
+    """Gemini CLI has no status command; it is signed in when it has an API key or saved Google credentials."""
+    if any(os.environ.get(key) for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI",
+                                            "GOOGLE_GENAI_USE_GCA")):
+        return True
+    folder = Path.home() / ".gemini"
+    if (folder / "oauth_creds.json").exists():
+        return True
+    try:
+        settings = json.loads((folder / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    auth = settings.get("security", {}).get("auth", {}) if isinstance(settings.get("security"), dict) else {}
+    return bool(settings.get("selectedAuthType") or (isinstance(auth, dict) and auth.get("selectedType")))
+
+
+def check(provider: str) -> Health:
+    binary = PROVIDERS[provider]
+    if not shutil.which(binary):
+        return Health(provider, False, detail=INSTALL[provider])
+    version = quiet([binary, "--version"])
+    health = Health(provider, True, version=first_line(version.stdout, 40) if version and version.returncode == 0 else "")
+    if provider == "claude":
+        status = quiet(["claude", "auth", "status"])
+        try:
+            health.signed_in = bool(json.loads(status.stdout).get("loggedIn")) if status else None
+        except (ValueError, AttributeError):
+            health.signed_in = None
+    elif provider == "openai":
+        status = quiet(["codex", "login", "status"])
+        health.signed_in = None if status is None else status.returncode == 0
+    else:
+        health.signed_in = gemini_signed_in()
+    if health.signed_in is False:
+        health.detail = SIGN_IN[provider]
+    return health
+
+
+def health_table(report: list[Health]) -> Group:
+    """One line per tool, then the fix for each that isn't ready (kept out of the table so it wraps in narrow windows)."""
+    table = Table.grid(padding=(0, 2))
+    fixes = []
+    for health in report:
+        if not health.installed:
+            status = Text("✗ not installed", style=f"bold {BAD}")
+        elif health.signed_in is False:
+            status = Text("✗ not signed in", style=f"bold {BAD}")
+        elif health.signed_in is None:
+            status = Text("? couldn't check sign-in", style=f"bold {WARN}")
+        else:
+            status = Text("● ready", style=f"bold {GOOD}")
+        table.add_row(Text(LABELS[health.provider], style=f"bold {COLORS[health.provider]}"), status,
+                      Text(health.version or "", style=MUTED))
+        if health.detail:
+            fixes.append(Text.assemble(("→ ", f"bold {ACCENT}"), (health.detail, ACCENT)))
+    return Group(table, *([Text("")] + fixes if fixes else []))
+
+
+def run_visible(command: str, cwd: Path | None = None) -> int:
+    """Run a command with the terminal attached, so installers and sign-in flows can talk to the person."""
+    console.print(Text.assemble(("  $ ", f"bold {ACCENT}"), (command, "#E8E8F5")))
+    try:
+        return subprocess.run(command, shell=True, cwd=cwd).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def setup(ask_first: bool) -> list[Health]:
+    """Check the three tools; when ask_first, offer to install or sign in to each one that isn't ready."""
+    report = [check(name) for name in PROVIDERS]
+    console.print(Panel(health_table(report), title=gradient(" SETUP "), title_align="left", box=box.ROUNDED,
+                        border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
+    if not ask_first:
+        return report
+    from prompt_toolkit.shortcuts import confirm
+
+    for health in report:
+        name = health.provider
+        if not health.installed:
+            if not shutil.which("npm"):
+                console.print(f"  [{BAD}]npm is missing.[/] Install Node.js (https://nodejs.org, or `brew install node`), "
+                              "then run /setup again.")
+                break
+            if confirm(f"Install {SESSION_NAMES[name]} now?"):
+                if run_visible(INSTALL_COMMANDS[name]) == 0 and confirm(f"Sign in to {SESSION_NAMES[name]} now?"):
+                    run_visible(SIGN_IN_COMMANDS[name])
+        elif health.signed_in is False and confirm(f"Sign in to {SESSION_NAMES[name]} now?"):
+            if name == "gemini":
+                console.print("  [dim]Gemini opens its chat: pick a sign-in method, then type /quit to come back.[/]")
+            run_visible(SIGN_IN_COMMANDS[name])
+    report = [check(name) for name in PROVIDERS]
+    console.print(health_table(report))
+    return report
+
+
+# Words that start a shell command far more often than a question for the council.
+SHELL_WORDS = {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pipx", "brew", "git", "cd", "ls", "cat", "python", "python3",
+               "node", "make", "docker", "curl", "wget", "sudo", "mkdir", "rm", "mv", "cp", "open", "code", "export",
+               "source", "echo", "claude", "gemini", "codex", "conclave", "uv", "cargo", "go", "bun", "deno", "touch"}
+
+
+def looks_like_shell(line: str) -> bool:
+    words = line.split()
+    return bool(words) and words[0] in SHELL_WORDS and "?" not in line and len(words) <= 14
+
+
 # ---------------------------------------------------------------- interactive session
 
 BANNER = (
@@ -1237,6 +1425,9 @@ BANNER = (
     " ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝",
 )
 COMMANDS = (
+    ("/setup", "check Claude, Gemini and Codex, and install or sign in to any that aren't ready"),
+    ("!<command>", "run a shell command without leaving Conclave (e.g. !git status)"),
+    ("/quick", "toggle the cross-examination round (on: advisers critique each other before the verdict)"),
     ("/convos", "list the Claude Code conversations for this project"),
     ("/attach <n|latest|id>", "bring a Claude Code conversation to the council"),
     ("/detach", "stop sending the attached conversation"),
@@ -1267,6 +1458,7 @@ class Session:
         self.timeout = timeout
         self.show_opinions = show_opinions
         self.save_sessions = True  # keep rounds as resumable sessions in each model's own tool
+        self.cross_examine = True  # advisers critique each other's opinions before the verdict
         self.history: list[tuple[str, str]] = []  # (question, verdict) pairs carried into follow-ups
         self.rounds: list[Round] = []
         self.last_report = ""
@@ -1306,6 +1498,9 @@ class Session:
                             Text(f"{excerpt(self.conversation.title, 60)} · {self.conversation.when}", style=f"bold {ACCENT}"))
         missing = [name for name in PROVIDERS if not shutil.which(PROVIDERS[name])] if revealed >= 3 else []
         fixes = [Text.assemble(("→ ", f"bold {ACCENT}"), (INSTALL[name], ACCENT)) for name in missing]
+        if missing:
+            fixes.append(Text.assemble(("→ ", f"bold {ACCENT}"), ("or type ", MUTED), ("/setup", f"bold {ACCENT}"),
+                                       (" and Conclave installs them and signs you in", MUTED)))
         return Panel(
             Group(self.council_table(revealed), *([Text("")] + fixes if fixes else []), Text(""), session),
             title=gradient(" THE COUNCIL "),
@@ -1405,6 +1600,7 @@ class Session:
             ("class:sep", "│  "),
             ("class:bar", f"memory {min(len(self.history), MEMORY)}/{MEMORY}   "),
             ("class:bar", "saving sessions   " if self.save_sessions else "private   "),
+            ("class:bar", "cross-exam   " if self.cross_examine else "quick   "),
             ("class:sep", "│  "),
             ("class:bar", f"Σ {count(tokens)} tok · {plural(len(self.rounds), 'round')} "),
         ]
@@ -1425,7 +1621,7 @@ class Session:
             lines += [f"*{' · '.join(facts)}*", ""]
             for name in ("gemini", "openai"):
                 if name in result.opinions:
-                    lines += [f"### {LABELS[name]} opinion", "", result.opinions[name], ""]
+                    lines += [f"### {LABELS[name]} opinion", "", result.opinion(name), ""]
         return "\n".join(lines).rstrip()
 
     # -- commands
@@ -1456,6 +1652,15 @@ class Session:
                 self.note(f"Opening {SESSION_NAMES[provider]}. Exit it to come back to Conclave.")
                 subprocess.run(last.sessions[provider], shell=True)
                 console.print()
+        elif name == "/setup":
+            setup(ask_first=True)
+            if self.prompt is not None:
+                console.print()
+                console.print(self.welcome_panel())
+        elif name == "/quick":
+            self.cross_examine = not self.cross_examine
+            self.note("Advisers now cross-examine each other before the verdict." if self.cross_examine else
+                      "Quick rounds: no cross-examination, so verdicts come sooner.")
         elif name == "/private":
             self.save_sessions = not self.save_sessions
             self.note("Rounds are saved as sessions in Claude Code, Gemini CLI and Codex." if self.save_sessions else
@@ -1488,7 +1693,7 @@ class Session:
             elif not last:
                 self.note("Nothing to show yet.")
             else:
-                body = {"brief": last.brief, "verdict": last.final}.get(what, last.opinions.get(what, ""))
+                body = {"brief": last.brief, "verdict": last.final}.get(what) or last.opinion(what)
                 if not body:
                     self.note(f"The last round has no {rest[0].lower()} to show.")
                 else:
@@ -1584,11 +1789,30 @@ class Session:
                             subtitle=Text(f" {home(self.project or Path.cwd())} · /attach <n> ", style=MUTED),
                             subtitle_align="right", box=box.ROUNDED, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
+    def shell(self, command: str) -> None:
+        """Run a shell command here. `cd` moves Conclave itself, since a child shell's cd wouldn't last."""
+        words = command.split(maxsplit=1)
+        if words and words[0] == "cd":
+            folder = Path(os.path.expandvars(words[1] if len(words) > 1 else "~")).expanduser()
+            folder = folder if folder.is_absolute() else Path.cwd() / folder
+            if not folder.is_dir():
+                console.print(f"  [{BAD}]No such folder:[/] {folder}")
+                return
+            os.chdir(folder.resolve())
+            found = conclave_context.conversations(Path.cwd(), limit=200)
+            self.note(f"Now in {home(Path.cwd())}" + (f": {plural(len(found), 'Claude Code conversation')} here, "
+                                                       "/convos lists them" if found else ""))
+            return
+        code = run_visible(command, cwd=self.project)
+        if code:
+            self.note(f"exited with status {code}")
+
     def ask(self, request: str) -> None:
         task = compose(request, self.project, self.conversation, self.history)
         console.print()
         try:
-            result = council(task, request, self.selected, self.timeout, cwd=self.project, save_sessions=self.save_sessions)
+            result = council(task, request, self.selected, self.timeout, cwd=self.project, save_sessions=self.save_sessions,
+                             cross_examine=self.cross_examine)
         except KeyboardInterrupt:
             console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
             return
@@ -1703,10 +1927,24 @@ def home(path: Path) -> str:
     return str(path).replace(str(Path.home()), "~", 1)
 
 
+def confirm_shell(line: str) -> bool:
+    from prompt_toolkit.shortcuts import confirm
+
+    console.print(Text.assemble(("  ", ""), ("That looks like a shell command. ", "#C9C8F5"),
+                                ("y", f"bold {ACCENT}"), (" runs it here, ", MUTED), ("n", f"bold {ACCENT}"),
+                                (" asks the council. (Start a line with ! to always run it.)", MUTED)))
+    try:
+        return confirm("Run it?")
+    except (KeyboardInterrupt, EOFError):
+        return False
+
+
 def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bool,
-                project: Path | None = None, conversation=None, save_sessions: bool = True) -> int:
+                project: Path | None = None, conversation=None, save_sessions: bool = True,
+                cross_examine: bool = True) -> int:
     session = Session(selected, timeout, show_opinions)
     session.save_sessions = save_sessions
+    session.cross_examine = cross_examine
     session.project, session.conversation = project, conversation
     session.prompt = prompt_session(session)
     session.welcome(animate=ANIMATE)
@@ -1723,6 +1961,10 @@ def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bo
         if line.startswith("/"):
             if not session.command(line):
                 break
+        elif line.startswith("!"):
+            session.shell(line[1:].strip())
+        elif looks_like_shell(line) and confirm_shell(line):
+            session.shell(line)
         else:
             session.ask(line)
             console.print()
@@ -1754,6 +1996,10 @@ def main() -> int:
     parser.add_argument("-c", "--conversation", metavar="N|latest|ID",
                         help="bring a Claude Code conversation for the project: its number in --list-conversations, latest, or session id")
     parser.add_argument("--list-conversations", action="store_true", help="list the project's Claude Code conversations and exit")
+    parser.add_argument("--quick", action="store_true",
+                        help="skip the cross-examination round, where advisers critique each other (see [council] in the config)")
+    parser.add_argument("--setup", action="store_true",
+                        help="check that Claude, Gemini and Codex are installed and signed in, and offer to fix any that aren't")
     parser.add_argument("--private", action="store_true",
                         help="don't save this run as sessions in Claude Code, Gemini CLI and Codex (see [sessions] in the config)")
     parser.add_argument("--handoff", action="store_true", help="after the verdict, save it and print the command that gives it back to Claude Code")
@@ -1767,6 +2013,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be at least 1")
+    if args.setup:
+        try:
+            apply_theme(load_config(args.config).theme or "violet")
+        except ValueError:
+            pass
+        report = setup(ask_first=sys.stdin.isatty() and sys.stdout.isatty())
+        return 0 if all(h.installed and h.signed_in is not False for h in report) else 1
     if args.install_app:
         import conclave_app
         return conclave_app.install_mac_app()
@@ -1811,6 +2064,7 @@ def main() -> int:
         return 2
     models = settings.models
     args.save_sessions = settings.save_sessions and not args.private
+    args.cross_examine = settings.cross_examine and not args.quick
     apply_theme(args.theme or settings.theme or "violet")
     selected = {
         "claude": args.claude_model or models.get("claude"),
@@ -1818,7 +2072,8 @@ def main() -> int:
         "openai": args.openai_model or models.get("openai"),
     }
     if session:
-        return interactive(selected, args.timeout, args.show_opinions, project, conversation, args.save_sessions)
+        return interactive(selected, args.timeout, args.show_opinions, project, conversation, args.save_sessions,
+                           args.cross_examine)
     return run(args, selected, project, conversation)
 
 

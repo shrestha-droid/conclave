@@ -100,7 +100,7 @@ def outcome(result: core.Round) -> dict:
         "agreement": result.agreement,
         "confidence": result.confidence,
         "brief": result.brief,
-        "opinions": result.opinions,
+        "opinions": {name: result.opinion(name) for name in result.opinions},
         "failed": result.failed,
         "errors": [{"provider": p, "headline": h, "message": m, "fix": core.fix_for(p, m)} for p, h, m in result.errors],
         "meta": core.round_meta(result),
@@ -114,10 +114,12 @@ def outcome(result: core.Round) -> dict:
 # ---------------------------------------------------------------- server
 
 class App:
-    def __init__(self, selected: dict[str, str | None], timeout: int, save_sessions: bool = True):
+    def __init__(self, selected: dict[str, str | None], timeout: int, save_sessions: bool = True,
+                 cross_examine: bool = True):
         self.selected = selected
         self.timeout = timeout
         self.save_sessions = save_sessions
+        self.cross_examine = cross_examine
         self.token = secrets.token_urlsafe(24)
         self.runs: dict[str, Run] = {}
         self.server: ThreadingHTTPServer | None = None
@@ -130,6 +132,7 @@ class App:
             "themes": core.THEMES,
             "timeout": self.timeout,
             "saveSessions": self.save_sessions,
+            "crossExamine": self.cross_examine,
             "providers": [
                 {"id": name, "label": core.LABELS[name], "role": core.ROLES[name], "cli": core.PROVIDERS[name],
                  "installed": bool(shutil.which(core.PROVIDERS[name])), "model": self.selected[name],
@@ -176,6 +179,7 @@ class App:
         timeout = int(body.get("timeout") or self.timeout)
         history = [(str(q), str(a)) for q, a in (body.get("history") or [])][-core.MEMORY:]
         save_sessions = bool(body.get("saveSessions", self.save_sessions))
+        cross_examine = bool(body.get("crossExamine", self.cross_examine))
         run = Run(project, conversation)
         self.runs[run.id] = run
 
@@ -183,7 +187,7 @@ class App:
             try:
                 task = core.compose(question, project, conversation, history)
                 result = core.deliberate(task, selected, timeout, WebView(run), cwd=project, control=run.control,
-                                         title=question, save_sessions=save_sessions)
+                                         title=question, save_sessions=save_sessions, cross_examine=cross_examine)
                 result.request = question
                 run.result = result
                 run.emit({"type": "done", "result": outcome(result)})
@@ -272,6 +276,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parts == ["ping"]:
                 return self.send(200, {"ok": True})
+            if method == "GET" and parts == ["health"]:
+                return self.send(200, [{"id": h.provider, "installed": h.installed, "signedIn": h.signed_in,
+                                        "version": h.version, "detail": h.detail}
+                                       for h in (core.check(name) for name in core.PROVIDERS)])
             if method == "GET" and parts == ["info"]:
                 return self.send(200, self.app.info())
             if method == "GET" and parts == ["projects"]:
@@ -378,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     core.apply_theme(settings.theme or "violet")
-    app = App({name: settings.models.get(name) for name in core.PROVIDERS}, args.timeout, settings.save_sessions)
+    app = App({name: settings.models.get(name) for name in core.PROVIDERS}, args.timeout, settings.save_sessions,
+              settings.cross_examine)
     server = serve(app, args.port or DEFAULT_PORT)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
@@ -700,7 +709,8 @@ details.opinion .text{padding:0 18px 14px;font-size:14px}
 select.field{width:auto;padding:5px 9px}
 .toggle{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer}
 .toggle input{accent-color:var(--accent)}
-.toggle + .go{margin-left:0}
+.toggle + .go,.toggle + .toggle{margin-left:0}
+.pill.unsigned i{background:var(--warn);box-shadow:0 0 8px var(--warn)}
 .continue{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 16px 16px;font-size:12px;color:var(--muted)}
 .continue .btn{border-color:color-mix(in srgb,var(--c) 45%,transparent)}
 .continue .btn b{color:var(--c)}
@@ -748,6 +758,7 @@ main,.wrap,.run,.card,.composer{min-width:0}
         <details class="models"><summary>⚙ Models and timeout</summary>
           <div class="modelgrid" id="modelgrid"></div>
         </details>
+        <label class="toggle" title="Gemini and Codex critique each other's opinions before Claude decides (slower, sharper)"><input type="checkbox" id="cross"> Cross-examine</label>
         <label class="toggle" title="Keep this round as sessions you can continue in Claude Code, Gemini CLI and Codex"><input type="checkbox" id="save"> Save sessions</label>
         <button class="go" id="ask">Ask the council <kbd>⌘↵</kbd></button>
       </div>
@@ -838,7 +849,7 @@ async function boot() {
   themes.value = store.get("theme", state.info.theme); applyTheme(themes.value);
   themes.onchange = () => applyTheme(themes.value);
   $("#pills").innerHTML = state.info.providers.map(p =>
-    `<div class="pill ${p.installed ? "" : "missing"}" title="${esc(p.installed ? p.cli + " is installed" : p.install)}"><i></i><b>${esc(NAMES[p.id])}</b>${esc(p.model || "default")}</div>`).join("");
+    `<div class="pill ${p.installed ? "" : "missing"}" data-id="${p.id}" title="${esc(p.installed ? p.cli + " is installed" : p.install)}"><i></i><b>${esc(NAMES[p.id])}</b>${esc(p.model || "default")}</div>`).join("");
   const saved = store.get("models", {});
   $("#modelgrid").innerHTML = state.info.providers.map(p =>
     `<label>${esc(NAMES[p.id])}<input class="field" data-model="${p.id}" placeholder="${esc(p.model || "provider default")}" value="${esc(saved[p.id] || "")}"></label>`).join("")
@@ -846,6 +857,13 @@ async function boot() {
   $("#modelgrid").oninput = () => { const m = {}; document.querySelectorAll("[data-model]").forEach(e => m[e.dataset.model] = e.value.trim());
     store.set("models", m); store.set("timeout", +$("#timeout").value || state.info.timeout); };
   $("#save").checked = store.get("saveSessions", state.info.saveSessions);
+  $("#cross").checked = store.get("crossExamine", state.info.crossExamine);
+  $("#cross").onchange = () => store.set("crossExamine", $("#cross").checked);
+  api("/api/health").then(report => report.forEach(h => {
+    const pill = $(`#pills .pill[data-id="${h.id}"]`); if (!pill) return;
+    pill.classList.toggle("missing", !h.installed); pill.classList.toggle("unsigned", h.installed && h.signedIn === false);
+    pill.title = !h.installed ? h.detail : h.signedIn === false ? h.detail : `${h.version || "installed"} · signed in`;
+  })).catch(() => {});
   $("#save").onchange = () => store.set("saveSessions", $("#save").checked);
   await loadProjects();
   const last = store.get("project", null);
@@ -912,7 +930,7 @@ async function ask() {
   const models = store.get("models", {}), timeout = store.get("timeout", state.info.timeout);
   let id;
   try { id = (await api("/api/runs", {question, project: state.project, conversation: state.conversation, models, timeout, history: state.history.slice(-3),
-    saveSessions: $("#save").checked})).id; }
+    saveSessions: $("#save").checked, crossExamine: $("#cross").checked})).id; }
   catch (e) { toast(e.message); return; }
   $("#hello")?.remove(); $("#question").value = "";
   const conv = state.convos.find(c => c.id === state.conversation);
@@ -920,23 +938,25 @@ async function ask() {
   const providers = Object.fromEntries(state.info.providers.map(p => [p.id, models[p.id] || p.model]));
   el.innerHTML = `<div class="runhead"><h2>${esc(question)}</h2><span class="clock">0:00</span><button class="btn" data-act="cancel">Cancel</button></div>
     <div class="chips" style="padding:10px 20px 0">${state.project ? `<span class="chip">⌂ <span>${esc(state.project.split("/").pop())}</span></span>` : ""}${conv ? `<span class="chip">❝ <span>${esc(conv.title)}</span></span>` : ""}</div>
-    <div class="tracker"><span class="ph" data-ph="brief">◉ BRIEF</span><span class="bar"></span><span class="ph" data-ph="advise">○ DELIBERATION</span><span class="bar"></span><span class="ph" data-ph="verdict">○ VERDICT</span></div>
+    <div class="tracker">${phaseList($("#cross").checked).map(([k, label], i) => `${i ? '<span class="bar"></span>' : ""}<span class="ph" data-ph="${k}">${i ? "○" : "◉"} ${label}</span>`).join("")}</div>
     <div class="cards">${["claude", "gemini", "openai"].map(n => card(n, providers[n])).join("")}</div>
     <div class="problems"></div>
     <div class="verdict"><div class="in"><h3><span class="wordmark">✦ VERDICT</span><span class="drafting">DRAFTING…</span></h3><div class="text"></div><div class="meterbox"></div></div></div>
     <div class="actions"></div><div class="continue"></div><div class="opinions"></div>`;
   $("#runs").prepend(el);
-  follow(id, el, question);
+  follow(id, el, question, $("#cross").checked);
 }
 
-function follow(id, el, question) {
+const phaseList = cross => [["brief", "BRIEF"], ["advise", "DELIBERATION"], ...(cross ? [["cross", "CROSS-EXAM"]] : []), ["verdict", "VERDICT"]];
+
+function follow(id, el, question, cross) {
   const run = {phase: "brief", started: Date.now(), cards: {}, done: false, tokens: {}};
   const cardEl = n => el.querySelector(`.card[data-name="${n}"]`);
   const tick = setInterval(() => {
     if (!run.done) el.querySelector(".clock").textContent = clock((Date.now() - run.started) / 1000);
     for (const [n, c] of Object.entries(run.cards)) if (c.start && !c.end) cardEl(n).querySelector(".time").textContent = clock((Date.now() - c.start) / 1000);
   }, 250);
-  const phases = ["brief", "advise", "verdict", "done"];
+  const phases = [...phaseList(cross).map(p => p[0]), "done"];
   const setPhase = p => { run.phase = p; const at = phases.indexOf(p);
     el.querySelectorAll(".ph").forEach((ph, i) => { ph.className = "ph" + (i < at ? " on" : i === at ? " now" : "");
       ph.textContent = (i < at ? "✓ " : i === at ? "◉ " : "○ ") + ph.textContent.slice(2); });
