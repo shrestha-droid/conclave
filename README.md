@@ -53,7 +53,7 @@ To update, run `conclave update`. It reinstalls the latest version from where yo
 conclave --app
 ```
 
-This opens Conclave in your browser: a monospace page in the same purple as the terminal, where each agent works in a card edged in its maker's colour. The sidebar lists every project you've worked on with Claude Code, Gemini CLI or Codex. Click one and it unfolds into its conversations from all three, each marked with its tool and how many errors it hit; the **claude · gemini · chatgpt** tabs above them switch between tools. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, outlined in its maker's colour: Claude clay, Gemini blue, ChatGPT green. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
+This opens Conclave in your browser: a monospace page in the same purple as the terminal, where each agent works in a card edged in its maker's colour. The sidebar lists every project you've worked on with Claude Code, Gemini CLI or Codex. Click one and it unfolds into its conversations from all three, each marked with its tool and how many errors it hit; the **claude · gemini · chatgpt** tabs above them switch between tools. Select a conversation to pick it back up: **continue in claude, gemini or chatgpt**. In its own tool (marked ↺) it carries on the very same session; in another, that agent reads the conversation and continues from where it left off, keeping its own session for the follow-ups. **Open in …** reopens it in its own tool in a Terminal window. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, outlined in its maker's colour: Claude clay, Gemini blue, ChatGPT green. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
 
 **Models** has a field for each agent in play: type any model, or pick one from its list. The list holds Claude's `opus`, `sonnet` and `haiku`, the models Antigravity and Ollama say they have, and any model an agent has reported or is set to in its own settings. Leave a field empty for that tool's default. **Send to** picks who gets the question: the whole council, or one agent. With one agent you also choose its access (**Read**, **Edit** or **Full**, explained below), and follow-ups carry on that agent's conversation.
 
@@ -124,6 +124,7 @@ Why does test_login keep failing after the session refactor?
 | `/access <read\|edit\|full>` | What hand-offs may do (see below). Full asks you to confirm |
 | `/apply [agent]` | Have an agent (Claude by default) carry out the last verdict in the project, at edit access or more |
 | `/convos [claude\|gemini\|chatgpt\|all]` | List the project's conversations from Claude Code, Gemini CLI and Codex, with message and error counts, or only one tool's |
+| `/resume <n\|latest\|id> [agent]` | Carry an old conversation on: in its own tool it's the same session, and `/resume 2 gemini` has another agent pick it up |
 | `/attach <n\|latest\|id>` | Send a conversation along with each question |
 | `/detach` | Stop sending it |
 | `/project [path\|none]` | Show or set the folder the models read and review |
@@ -210,6 +211,8 @@ command = "ollama run mistral"
 label = "Mistral"
 strengths = "small local model, private"
 ```
+
+**Small talk.** A greeting or a question too simple to need a second opinion doesn't convene the council: Claude answers it on its own.
 
 **Cross-examination.** After the advisers answer, each one reads the others' opinions and says where they're wrong before Claude writes the verdict. It's on by default; `--quick` or `/quick` skips it.
 

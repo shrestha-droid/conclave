@@ -186,7 +186,8 @@ class App:
         return {
             "project": str(project),
             "conversations": [{"id": c.id, "title": c.title, "when": c.when, "messages": c.messages,
-                               "errors": c.errors, "branch": c.branch, "tool": c.tool, "toolName": c.tool_name}
+                               "errors": c.errors, "branch": c.branch, "tool": c.tool, "toolName": c.tool_name,
+                               "native": [a for a in ("claude", "gemini", "openai") if core.can_resume(c, a)]}
                               for c in context.conversations(project)],
         }
 
@@ -224,6 +225,9 @@ class App:
         if access not in core.ACCESS_LEVELS:
             raise ValueError("access must be read, edit or full")
         resume = str(body.get("thread") or "") if agent else ""
+        continuing = bool(body.get("continuing")) and conversation is not None
+        if continuing and agent and not resume and core.can_resume(conversation, agent):
+            resume = conversation.id  # carry on the very same session in its own tool
         task = ""
         if body.get("apply"):
             source = self.runs.get(str(body["apply"]))
@@ -238,7 +242,8 @@ class App:
         def work() -> None:
             try:
                 if agent:
-                    work_task = task or (question if resume else core.compose(question, project, conversation, history))
+                    work_task = task or (question if resume else core.compose(question, project, conversation, history,
+                                                                              continuing))
                     result = core.solo(work_task, agent, selected, timeout, WebView(run), cwd=project, control=run.control,
                                        title=question, save_sessions=save_sessions, access=access, resume=resume)
                 else:
@@ -265,22 +270,35 @@ class App:
         command = (run.result.sessions if run.result else {}).get(provider)
         if not command:
             raise ValueError("That session wasn't saved")
-        opened = False
-        if sys.platform == "darwin" and shutil.which("osascript"):
-            script = command.replace("\\", "\\\\").replace('"', '\\"')
-            try:
-                subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
-                                "-e", 'tell application "Terminal" to activate'], check=True, capture_output=True, timeout=15)
-                opened = True
-            except (OSError, subprocess.SubprocessError):
-                pass
-        return {"command": command, "opened": opened}
+        return {"command": command, "opened": open_in_terminal(command)}
+
+    def open_conversation(self, body: dict) -> dict:
+        """Reopen one of the listed conversations in its own tool, in a Terminal window (macOS)."""
+        project = Path(str(body.get("project") or Path.cwd())).expanduser().resolve()
+        conversation = context.find(project, str(body.get("id") or ""))
+        if not conversation:
+            raise ValueError("That conversation is no longer available")
+        command = context.resume_command(conversation)
+        return {"command": command, "opened": open_in_terminal(command)}
 
     def handoff(self, run: Run) -> dict:
         if not run.result or not run.result.final:
             raise ValueError("There is no verdict to hand back yet")
         path, command = context.handoff(run.project or Path.cwd(), run.conversation, run.result.final)
         return {"path": str(path), "command": command}
+
+
+def open_in_terminal(command: str) -> bool:
+    """Run a command in a new Terminal window on a Mac; False where that isn't possible."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        return False
+    script = command.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
+                        "-e", 'tell application "Terminal" to activate'], check=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -346,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.app.projects())
             if method == "GET" and parts == ["conversations"]:
                 return self.send(200, self.app.conversations((query.get("project") or [str(Path.cwd())])[0]))
+            if method == "POST" and parts == ["conversations", "open"]:
+                return self.send(200, self.app.open_conversation(self.body()))
             if method == "POST" and parts == ["runs"]:
                 return self.send(200, {"id": self.app.start_run(self.body()).id})
             if len(parts) >= 2 and parts[0] == "runs":
@@ -692,6 +712,13 @@ aside{border-right:1px solid var(--edge);overflow:auto;padding:20px 14px 30px;di
 .leaf .s{color:var(--muted);font-size:11px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;padding-left:14px}
 .leaf:hover .t,.leaf.on .t{color:var(--text)}
 .leaf.on{background:color-mix(in srgb,var(--c) 11%,var(--panel));box-shadow:inset 2px 0 0 var(--c)}
+.acts{display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:7px 0 2px 14px;font-size:11px;animation:scaffold .25s ease both}
+.acts .k{color:var(--muted);margin-right:2px}
+.acts [data-cont]{cursor:pointer;color:var(--c);padding:0 8px;border:1px solid color-mix(in srgb,var(--c) 45%,var(--edge));border-radius:999px;background:color-mix(in srgb,var(--c) 8%,transparent)}
+.acts [data-cont]:hover{background:color-mix(in srgb,var(--c) 20%,transparent)}
+.acts [data-cont] b{font-weight:400;color:var(--muted);margin-left:4px}
+.acts [data-open]{cursor:pointer;color:var(--muted);text-decoration:underline;text-underline-offset:3px;margin-left:4px}
+.acts [data-open]:hover{color:var(--text)}
 @keyframes scaffold{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
 
 main{overflow:auto;padding:28px 34px 80px}
@@ -1078,6 +1105,7 @@ function renderCouncil() {
       title="${esc(a.name + absent(a))}">${sprite(a.id, "done")}${esc(handle(a.id))}</span>`).join("");
   $("#sendto").querySelectorAll("[data-dest]").forEach(el => el.onclick = () => {
     state.target = el.dataset.dest || null; store.set("target", state.target);
+    if (!state.target) state.continuing = null;
     if (state.target && !AG(state.target).installed) toast(`${AG(state.target).name} isn't installed. In a terminal, run: ${AG(state.target).installCommand || AG(state.target).install}`);
     renderCouncil(); renderContext(); });
   $("#lineup").style.display = state.target ? "none" : "";
@@ -1141,8 +1169,27 @@ function renderProjects() {
   $("#projects").querySelectorAll(".proj > .item").forEach(el => el.onclick = () => selectProject(el.parentElement.dataset.path));
   $("#projects").querySelectorAll("[data-tool-filter]").forEach(el => el.onclick = () => {
     state.convoTool = el.dataset.toolFilter; store.set("convoTool", state.convoTool); renderProjects(); });
-  $("#projects").querySelectorAll(".leaf").forEach(el => el.onclick = () => {
-    state.conversation = state.conversation === el.dataset.id ? null : el.dataset.id; renderProjects(); renderContext(); $("#question").focus(); });
+  $("#projects").querySelectorAll(".leaf").forEach(el => el.onclick = event => {
+    const c = state.convos.find(c => c.id === el.dataset.id);
+    const cont = event.target.closest("[data-cont]");
+    if (cont) return continueIn(c, cont.dataset.cont);
+    if (event.target.closest("[data-open]")) return api("/api/conversations/open", {project: state.project, id: c.id})
+      .then(r => r.opened ? toast(`Opened in ${c.toolName}`) : navigator.clipboard.writeText(r.command).then(() => toast("Command copied: paste it in a terminal"), () => toast(r.command)))
+      .catch(e => toast(e.message));
+    state.conversation = state.conversation === el.dataset.id ? null : el.dataset.id;
+    if (state.continuing !== state.conversation) state.continuing = null;
+    renderProjects(); renderContext(); $("#question").focus(); });
+}
+
+// Pick an old conversation back up: in its own tool it carries on the same session; in another, that agent reads the
+// conversation and continues from there, then keeps its own session for the follow-ups.
+function continueIn(c, agent) {
+  state.conversation = c.id; state.continuing = c.id; state.target = agent; store.set("target", agent);
+  delete state.threads[agent];
+  renderCouncil(); renderProjects(); renderContext();
+  $("#question").placeholder = `Carry on “${c.title.slice(0, 60)}” with ${AG(agent).name}…`;
+  $("#question").focus();
+  toast((c.native || []).includes(agent) ? `Continuing the same ${c.toolName} session` : `${AG(agent).name} will pick this up from ${c.toolName}`);
 }
 const renderConvos = renderProjects;
 
@@ -1157,7 +1204,11 @@ function treeHTML() {
   return `<div class="tree">${Object.keys(counts).length > 2 ? `<div class="ftabs">${tabs}</div>` : ""}` + shown.map((c, i) =>
     `<div class="leaf ${state.conversation === c.id ? "on" : ""}" data-id="${esc(c.id)}" style="--i:${i};--c:var(--${c.tool})" title="${esc(`${c.toolName} · ${c.messages} messages · ${c.title}`)}">`
     + `<div class="t"><i></i>${esc(c.title)}</div><div class="s"><span>${esc(handle(c.tool))}</span><span>${esc(c.when)}</span>`
-    + `${c.errors ? `<span class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</span>` : ""}${c.branch ? `<span>⎇ ${esc(c.branch)}</span>` : ""}</div></div>`).join("") + "</div>";
+    + `${c.errors ? `<span class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</span>` : ""}${c.branch ? `<span>⎇ ${esc(c.branch)}</span>` : ""}</div>`
+    + (state.conversation === c.id ? `<div class="acts"><span class="k">continue in</span>` + ["claude", "gemini", "openai"].map(a =>
+      `<span data-cont="${a}" style="--c:var(--${a})" title="${esc((c.native || []).includes(a) ? `Carry on this same ${c.toolName} session` : `${AG(a).name} reads this conversation and carries on from where it left off`)}">${esc(handle(a))}${(c.native || []).includes(a) ? "<b>↺</b>" : ""}</span>`).join("")
+      + `<span data-open title="Reopen it in ${esc(c.toolName)} itself, in a Terminal window">open in ${esc(c.toolName)} ↗</span></div>` : "")
+    + `</div>`).join("") + "</div>";
 }
 
 function renderContext() {
@@ -1165,14 +1216,15 @@ function renderContext() {
   if (state.project) chips.push(`<span class="chip live">⌂ <span>${esc(state.project)}</span><button data-x="project" title="Stop reviewing this project">✕</button></span>`);
   else chips.push(`<span class="chip">No project: the models run in ${esc(state.info.cwd)}</span>`);
   const c = state.convos.find(c => c.id === state.conversation);
-  if (c) chips.push(`<span class="chip live" style="--c:var(--${c.tool})">❝ <b style="color:var(--c);font-weight:400">${esc(handle(c.tool))}</b> <span>${esc(c.title)}</span>${c.errors ? `<b class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</b>` : ""}<button data-x="conversation" title="Detach">✕</button></span>`);
+  if (c && state.continuing === c.id && state.target) chips.push(`<span class="chip live" style="--c:var(--${state.target})">↺ <b style="color:var(--c);font-weight:400">continuing in ${esc(handle(state.target))}</b> <span>${esc(c.title)}</span><button data-x="conversation" title="Stop">✕</button></span>`);
+  else if (c) chips.push(`<span class="chip live" style="--c:var(--${c.tool})">❝ <b style="color:var(--c);font-weight:400">${esc(handle(c.tool))}</b> <span>${esc(c.title)}</span>${c.errors ? `<b class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</b>` : ""}<button data-x="conversation" title="Detach">✕</button></span>`);
   else if (state.project && state.convos.length) chips.push(`<span class="chip">Attach a conversation from the sidebar for context</span>`);
-  if (state.target && state.threads[state.target]) chips.push(`<span class="chip live" style="${vars(state.target)}">↺ <span>carrying on ${esc(AG(state.target).name)}'s conversation</span><button data-x="thread" title="Start a new conversation with it">✕</button></span>`);
+  if (state.target && state.threads[state.target] && !(c && state.continuing === c.id)) chips.push(`<span class="chip live" style="${vars(state.target)}">↺ <span>carrying on ${esc(AG(state.target).name)}'s conversation</span><button data-x="thread" title="Start a new conversation with it">✕</button></span>`);
   else if (state.history.length) chips.push(`<span class="chip">↺ follow-up remembers ${Math.min(state.history.length, 3)} answer${state.history.length > 1 ? "s" : ""}<button data-x="history" title="Start fresh">✕</button></span>`);
   $("#context").innerHTML = chips.join("");
   $("#context").querySelectorAll("[data-x]").forEach(b => b.onclick = () => {
     if (b.dataset.x === "project") { state.project = null; state.conversation = null; state.convos = []; state.threads = {}; store.set("project", null); loadProjects(); }
-    if (b.dataset.x === "conversation") { state.conversation = null; renderConvos(); }
+    if (b.dataset.x === "conversation") { state.conversation = null; state.continuing = null; renderConvos(); }
     if (b.dataset.x === "history") state.history = [];
     if (b.dataset.x === "thread") delete state.threads[state.target];
     renderContext(); });
@@ -1198,7 +1250,8 @@ async function ask(opts = {}) {
   let id;
   try { id = (await api("/api/runs", {question, project: state.project, conversation: state.conversation, models, timeout, history: state.history.slice(-3),
     saveSessions: $("#save").checked, crossExamine: $("#cross").checked, advisers, split, agent, access,
-    thread: agent ? state.threads[agent] || "" : "", apply: opts.apply || ""})).id; }
+    thread: agent ? state.threads[agent] || "" : "", apply: opts.apply || "",
+    continuing: !!(agent && !opts.apply && state.continuing && state.continuing === state.conversation)})).id; }
   catch (e) { toast(e.message); return; }
   $("#hello")?.remove(); if (!opts.question) $("#question").value = "";
   const conv = state.convos.find(c => c.id === state.conversation);
@@ -1283,6 +1336,7 @@ function finish(el, e, question) {
   if (solo && r.thread) { state.threads[r.speaker] = r.thread; renderContext(); }
   const v = el.querySelector(".verdict"); v.classList.add("show"); v.querySelector(".drafting").remove();
   v.querySelector(".sub").textContent = r.meta;
+  if (r.mode === "direct") v.querySelector(".ttl").innerHTML = `answer <span class="drafting">· claude answered this one without the council</span>`;
   v.querySelector(".text").innerHTML = md(r.final);
   const levels = {strong: [11, "var(--good)"], partial: [7, "var(--warn)"], split: [3, "var(--bad)"]}, dots = {high: 3, medium: 2, low: 1};
   let meter = "";

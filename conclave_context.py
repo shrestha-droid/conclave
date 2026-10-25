@@ -608,7 +608,7 @@ def snapshot(project: Path, diff_budget: int = 12000) -> str:
     return "\n".join(parts)
 
 
-def context_block(project: Path | None, conversation: Conversation | None) -> str:
+def context_block(project: Path | None, conversation: Conversation | None, continuing: bool = False) -> str:
     """Everything the council should know about the project and conversation, ready to put before the request."""
     parts = []
     if project:
@@ -619,10 +619,23 @@ def context_block(project: Path | None, conversation: Conversation | None) -> st
             parts.append(f"<project_state>\n{state}\n</project_state>")
     if conversation:
         tag = {"claude": "claude_code", "gemini": "gemini_cli", "openai": "codex"}[conversation.tool]
-        parts.append(f"The user has been working on this with {conversation.tool_name} and wants a second opinion on that "
-                     "conversation, especially on errors that a fresh look might resolve.")
+        if continuing:
+            parts.append(f"This is a conversation the user had with {conversation.tool_name}. They want you to pick it up "
+                         "and carry on from where it left off, as if you had been part of it.")
+        else:
+            parts.append(f"The user has been working on this with {conversation.tool_name} and wants a second opinion on "
+                         "that conversation, especially on errors that a fresh look might resolve.")
         parts.append(f"<{tag}_conversation>\n{transcript(conversation)}\n</{tag}_conversation>")
     return "\n\n".join(parts)
+
+
+RESUME = {"claude": "claude --resume {id}", "gemini": "gemini --resume {id}", "openai": "codex resume {id}"}
+
+
+def resume_command(conversation: Conversation) -> str:
+    """The command that reopens a conversation in its own tool, in the folder it was in."""
+    folder = conversation.project or str(Path.cwd())
+    return f"cd {quote(folder)} && {RESUME[conversation.tool].format(id=quote(conversation.id))}"
 
 
 def handoff(project: Path, conversation: Conversation | None, verdict: str) -> tuple[Path, str]:

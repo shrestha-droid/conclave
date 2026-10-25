@@ -61,7 +61,7 @@ store.mkdir(exist_ok=True)
 memory = ""
 if "--resume" in args:
     session = store / args[args.index("--resume") + 1]
-    memory = session.read_text()
+    memory = session.read_text() if session.exists() else ""  # a real Claude Code conversation, made outside the fake
     session.write_text(memory + prompt)
 elif "--session-id" in args:
     (store / args[args.index("--session-id") + 1]).write_text(prompt)
@@ -85,6 +85,10 @@ if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("claude " + os.getcwd() + "\\n")
 if "Carry out this plan" in prompt:
     say("APPLIED THE PLAN")
+elif "USER TASK:\\nhello" in prompt:
+    say("DIRECT: Hello! What are we working on?")
+elif "pick it up and carry on" in prompt:
+    say("CARRYING ON (" + ("saw conversation" if "<claude_code_conversation>" in prompt else "no transcript") + ")")
 elif "Your advisers:" in prompt and os.environ.get("FAKE_PLAN"):
     say(json.dumps({"plan": [{"agent": "gemini", "title": "Map the schema", "instructions": "List the tables"},
                              {"agent": "codex", "title": "Run the tests", "instructions": "Run pytest"},
@@ -801,6 +805,14 @@ def test_unknown_conversation_is_a_usage_error(fake_bin, tmp_path):
     assert result.returncode == 2 and "no conversation 'nope'" in result.stderr
 
 
+def test_small_talk_skips_the_council(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "hello", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "Hello! What are we working on?\n"
+    assert list(argv_log(log)) == ["claude"] and "Claude answered directly" in result.stderr
+
+
 def test_hand_off_to_one_agent(fake_bin, tmp_path):
     log = tmp_path / "argv.log"
     result = run_cli(fake_bin, "--agent", "gemini", "--access", "edit", "Fix the login bug", tmp_path=tmp_path,
@@ -1003,6 +1015,9 @@ def test_interactive_conversation_and_handoff(fake_bin, tmp_path):
     term.command("/attach latest", "Attached")
     term.command("Why do the tests fail?", "saw conversation")
     term.command("/handoff", "HAND BACK TO CLAUDE CODE", "claude --resume abc12345-0000")
+    term.command("/resume latest", "in the same session")
+    term.command("/resume 1 chatgpt", "carry on from where it left off")
+    term.command("/to council", "whole council again")
     term.command("/retry", "Asking again", "saw conversation")
     term.command("/detach", "no longer sent")
     term.send("/exit")
@@ -1139,6 +1154,33 @@ def test_app_hands_off_carries_on_and_applies(app_server, tmp_path, monkeypatch)
 
 def result_thread(argv: list[str]) -> str:
     return argv[argv.index("--session-id") + 1]
+
+
+def test_app_continues_old_conversations(app_server, tmp_path, monkeypatch):
+    app, base = app_server
+    log = tmp_path / "argv.log"
+    monkeypatch.setenv("ARGV_LOG", str(log))
+    project = tmp_path / "shop"
+    project.mkdir()
+    write_conversation(tmp_path / "claude-home", project)
+    listed = call(base, f"/api/conversations?project={project}", app.token)["conversations"]
+    assert listed[0]["native"] == ["claude"]
+    # In its own tool: the very same Claude Code session carries on.
+    run = call(base, "/api/runs", app.token, {"question": "Carry on", "project": str(project), "conversation": "abc12345-0000",
+                                               "agent": "claude", "continuing": True})
+    result = events(base, run["id"], app.token)[-1]["result"]
+    assert result["thread"] == "abc12345-0000"
+    claude = argv_log(log)["claude"][-1]
+    assert claude[claude.index("--resume") + 1] == "abc12345-0000"
+    # In another agent: it reads the conversation and picks it up.
+    run = call(base, "/api/runs", app.token, {"question": "Carry on", "project": str(project), "conversation": "abc12345-0000",
+                                               "agent": "openai", "continuing": True, "thread": ""})
+    assert events(base, run["id"], app.token)[-1]["result"]["final"] == "CODEX SAYS go"
+    assert "resume" not in argv_log(log)["codex"][-1]  # a fresh ChatGPT session, given the transcript
+    prompt = conclave.compose("Carry on", project, conclave_context.find(project, "latest"), continuing=True)
+    assert "pick it up and carry on" in prompt and "<claude_code_conversation>" in prompt
+    command = conclave_context.resume_command(conclave_context.find(project, "latest"))
+    assert command.endswith("claude --resume abc12345-0000")
 
 
 def test_app_rejects_bad_requests(app_server):

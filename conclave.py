@@ -1334,7 +1334,7 @@ class Round:
     sessions: dict[str, str] = field(default_factory=dict)  # provider -> command that continues its saved session
     rebuttals: dict[str, str] = field(default_factory=dict)  # provider -> its critique of the other advisers
     advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS
-    mode: str = "council"  # "split" when Claude handed out subtasks, "solo" for a hand-off to one agent
+    mode: str = "council"  # "split": Claude handed out subtasks; "solo": a hand-off to one agent; "direct": Claude alone
     speaker: str = "claude"  # whose answer `final` is
     access: str = "read"
     thread: str = ""  # on a hand-off, the agent's own session id, so a follow-up can carry on in it
@@ -1395,11 +1395,20 @@ def remember(history: list[tuple[str, str]]) -> str:
     )
 
 
-def compose(request: str, project: Path | None = None, conversation=None, history=()) -> str:
-    """The task the council sees: project state, the attached conversation and earlier answers, then the request."""
+def can_resume(conversation, agent: str) -> bool:
+    """Whether `agent` can carry on this conversation's own session: Claude Code and Codex always can; Gemini only when
+    its seat runs Gemini CLI, since Antigravity can't open Gemini CLI's sessions."""
+    if conversation.tool == "gemini":
+        return agent == "gemini" and AGENTS["gemini"].reader == "gemini"
+    return conversation.tool == agent
+
+
+def compose(request: str, project: Path | None = None, conversation=None, history=(), continuing: bool = False) -> str:
+    """The task the council sees: project state, the attached conversation and earlier answers, then the request.
+    With `continuing`, the agent is picking that conversation up rather than reviewing it."""
     parts = []
     if project or conversation:
-        parts.append(conclave_context.context_block(project, conversation))
+        parts.append(conclave_context.context_block(project, conversation, continuing))
     if history:
         parts.append(remember(list(history)) + "\n\nThe exchanges above are context from this session.")
     if not parts:
@@ -1487,6 +1496,10 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
     else:
         job = brief_job
 
+    # Greetings and one-line questions don't need the council; Claude answers them itself.
+    job += (" But if the task is small talk, a greeting, or so simple that a second opinion adds nothing (a quick "
+            "fact, a one-line answer), skip all of that: reply with DIRECT: on the first line and then your answer.")
+
     workers = max(2, len(advisers))
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
@@ -1499,6 +1512,14 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
             result.errors.append(("claude", "CLAUDE COULDN'T START THE REVIEW", str(exc)))
             return result
         tally("claude", reply)
+        direct = DIRECT.match(reply.text)
+        if direct:
+            result.mode, result.final = "direct", reply.text[direct.end():].strip()
+            for name in advisers:
+                view.finish(name, "waiting", "not needed for this one")
+            view.set_phase("done")
+            view.finish("claude", "done", "answered directly", preview(result.final))
+            return result
         plan = parse_plan(reply.text, advisers) if split != "never" and advisers else None
         result.brief = reply.text if not plan else "\n".join(f"{i}. **{t['title']}** → {AGENTS[t['agent']].name}"
                                                              for i, t in enumerate(plan, 1))
@@ -1545,6 +1566,9 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
         result.opinions = {name: text for name, text in result.opinions.items() if name not in result.failed}
         result.seconds = time.monotonic() - started
     return result
+
+
+DIRECT = re.compile(r"^\s*\**DIRECT\**\s*:\s*\**\s*", re.IGNORECASE)
 
 
 def run_council(task: str, advisers: tuple[str, ...], cross_examine: bool, view, pool, call, tally, plan_for,
@@ -1764,6 +1788,8 @@ def council(task: str, title: str, selected: dict[str, str | None], timeout: int
 def helpers_line(result: Round) -> str:
     if result.mode == "solo":
         return f"{SESSION_NAMES[result.speaker]} · {result.access} access"
+    if result.mode == "direct":
+        return "Claude answered directly"
     if result.mode == "split":
         return f"{sum('result' in t for t in result.plan)}/{len(result.plan)} subtasks"
     return f"{len(result.advisers) - len(result.failed)}/{len(result.advisers)} advisers"
@@ -1780,7 +1806,7 @@ def round_meta(result: Round) -> str:
 
 def write_report(result: Round, show_opinions: bool, output: Path | None) -> str:
     """Print the verdict (and opinions when asked), save it to output if given, and return it as Markdown."""
-    headline = f"{LABELS[result.speaker]} · ANSWER" if result.mode == "solo" else "✦ VERDICT"
+    headline = f"{LABELS[result.speaker]} · ANSWER" if result.mode == "solo" else "✦ ANSWER" if result.mode == "direct" else "✦ VERDICT"
     sections = [(result.speaker, headline, result.final)] if result.final else []
     if show_opinions or not result.final:
         heading = "SUBTASKS" if result.mode == "split" else "OPINION"
@@ -2072,6 +2098,7 @@ COMMANDS = (
     ("/quick", "toggle the cross-examination round (on: advisers critique each other before the verdict)"),
     ("/convos [claude|gemini|chatgpt|all]", "list this project's conversations from Claude Code, Gemini CLI and Codex"),
     ("/attach <n|latest|id>", "bring one of those conversations to the council"),
+    ("/resume <n|latest|id> [agent]", "carry an old conversation on, in its own tool or in another agent (/resume 2 gemini)"),
     ("/detach", "stop sending the attached conversation"),
     ("/project [path|none]", "show or set the project folder the models read and review"),
     ("/handoff", "save the last verdict and show the command that gives it back to Claude Code"),
@@ -2109,6 +2136,7 @@ class Session:
         self.project: Path | None = None  # the folder the models work in and review
         self.conversation = None  # an attached conversation from Claude Code, Gemini CLI or Codex
         self.convo_tools = conclave_context.TOOLS  # whose conversations /convos lists and /attach numbers
+        self.continuing = ""  # the id of a conversation being carried on (/resume) rather than reviewed
         self.background = False  # whether the terminal's background is painted in the theme's colour
         self.target: str | None = None  # where plain messages go: None for the council, or one agent's id
         self.access = "read"  # what hand-offs may do (the council itself always only reads)
@@ -2555,7 +2583,27 @@ class Session:
                     self.threads.clear()  # an agent's session belongs to the folder it ran in
                 self.note(f"Attached {found.tool_name}'s “{excerpt(found.title, 60)}” ({found.messages} messages, {plural(found.errors, 'error')}, {found.when}). "
                           "Each question now includes it.")
+        elif name == "/resume":
+            found = conclave_context.find(self.project or Path.cwd(), rest[0] if rest else "latest", self.convo_tools)
+            agent = self.agent_named(rest[1]) if len(rest) > 1 else None
+            if not found or agent == "council" or (len(rest) > 1 and not agent):
+                console.print(f"  [{BAD}]Usage:[/] /resume <n|latest|id> [claude|gemini|chatgpt]   (/convos lists them)")
+                return True
+            agent = agent or found.tool
+            if found.project and Path(found.project).is_dir() and Path(found.project) != self.project:
+                self.project = Path(found.project)
+                self.threads.clear()
+            self.conversation, self.continuing, self.target = found, found.id, agent
+            self.threads.pop(agent, None)
+            if can_resume(found, agent):
+                self.threads[agent] = found.id
+                self.note(f"Carrying on {found.tool_name}'s “{excerpt(found.title, 60)}” in the same session. "
+                          "Type to continue; /to council goes back to the council.")
+            else:
+                self.note(f"{AGENTS[agent].name} will read {found.tool_name}'s “{excerpt(found.title, 60)}” and carry on "
+                          "from where it left off. Type to continue.")
         elif name == "/detach":
+            self.continuing = ""
             self.conversation = None
             self.note("The conversation is no longer sent to the council.")
         elif name == "/project":
@@ -2645,7 +2693,9 @@ class Session:
         resume = self.threads.get(agent, "") if agent else ""
         if not task:
             # An agent carrying on its own session already has the conversation and earlier answers.
-            task = request if resume else compose(request, self.project, self.conversation, self.history)
+            task = request if resume else compose(request, self.project, self.conversation, self.history,
+                                                  continuing=bool(agent and self.conversation
+                                                                  and self.continuing == self.conversation.id))
         console.print()
         try:
             result = council(task, request, self.selected, self.timeout, cwd=self.project, save_sessions=self.save_sessions,
@@ -2713,6 +2763,7 @@ def prompt_session(session: Session):
             "/split": [("auto", "Claude decides"), ("always", "always split"), ("never", "never split")],
             "/theme": [(name, "") for name in THEMES],
             "/attach": [("latest", "the newest conversation for this project")],
+            "/resume": [("latest", "carry on the newest conversation")],
             "/project": [("none", "stop reviewing a project")],
             "/to": [(handle(a), AGENTS[a].name) for a in AGENTS] + [("council", "the whole council")],
             "/ask": [(handle(a), AGENTS[a].name) for a in AGENTS],
