@@ -48,14 +48,26 @@ _add(Agent(
     "Sign in again: run `claude` in your terminal, type /login, then retry.", "claude auth login",
     sprite="claude", resume="claude --resume {id}",
 ))
-_add(Agent(
-    "gemini", "✧ GEMINI", "Gemini CLI", "gemini", "gemini",
-    "a very large context window, so it reads whole codebases and long logs well; can search the web",
+# Gemini sits at the council through one of two Google tools. Google stopped serving Gemini CLI to personal
+# accounts (free, AI Pro and Ultra) on 18 June 2026 and moved them to Antigravity CLI (`agy`); Gemini CLI still
+# works with a paid Gemini API key or a Code Assist Standard or Enterprise licence. choose_gemini() picks one.
+GEMINI_STRENGTHS = "a very large context window, so it reads whole codebases and long logs well; can search the web"
+ANTIGRAVITY_INSTALL = "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+GEMINI_CLI = Agent(
+    "gemini", "✧ GEMINI", "Gemini CLI", "gemini", "gemini", GEMINI_STRENGTHS,
     "Install Gemini CLI: npm install -g @google/gemini-cli",
     "npm install -g @google/gemini-cli",
     "Sign in again: run `gemini` in your terminal, choose a sign-in method, then retry.", "gemini",
     sprite="gemini", resume="gemini --resume {id}",
-))
+)
+ANTIGRAVITY = Agent(
+    "gemini", "✧ GEMINI", "Antigravity CLI", "agy", "antigravity", GEMINI_STRENGTHS,
+    f"Install Antigravity CLI, Google's replacement for Gemini CLI: {ANTIGRAVITY_INSTALL}",
+    ANTIGRAVITY_INSTALL,
+    "Sign in: run `agy` in your terminal and sign in with your Google account, then retry.", "agy",
+    sprite="gemini", resume="agy --conversation {id}",
+)
+_add(ANTIGRAVITY)
 _add(Agent(
     # ChatGPT has no command-line tool of its own; Codex is OpenAI's, signed in with your ChatGPT account and
     # running ChatGPT's GPT models, so ChatGPT joins the council through it.
@@ -99,6 +111,19 @@ _add(Agent(
 ))
 
 DEFAULT_ADVISERS = ("gemini", "openai")
+GEMINI_TOOLS = ("auto", "antigravity", "gemini-cli")
+
+
+def choose_gemini(tool: str = "auto", which=None) -> Agent:
+    """Seat Gemini through Antigravity CLI or Gemini CLI. "auto" takes Antigravity when `agy` is installed, then
+    Gemini CLI when `gemini` is, and otherwise Antigravity, since that is what a personal Google account can use."""
+    import shutil
+
+    which = which or shutil.which
+    if tool == "auto":
+        tool = "antigravity" if which("agy") or not which("gemini") else "gemini-cli"
+    AGENTS["gemini"] = ANTIGRAVITY if tool == "antigravity" else GEMINI_CLI
+    return AGENTS["gemini"]
 
 
 def custom(agent_id: str, spec: dict) -> Agent:

@@ -38,7 +38,7 @@ import conclave_context
 from conclave_agents import AGENTS
 
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
 ALIASES = {"codex": "openai", "gpt": "openai", "chatgpt": "openai", "council": "council"}
 
@@ -54,6 +54,20 @@ SIGN_IN: dict[str, str] = {}
 SESSION_NAMES: dict[str, str] = {}
 
 
+def seat_gemini(tool: str = "auto") -> None:
+    """Run the Gemini seat through Antigravity CLI or Gemini CLI (see conclave_agents.choose_gemini)."""
+    add_local_bin()
+    conclave_agents.choose_gemini(tool)
+    sync_agents()
+
+
+def add_local_bin() -> None:
+    """Antigravity's installer puts `agy` in ~/.local/bin, which a Mac's default PATH leaves out."""
+    local_bin = Path.home() / ".local" / "bin"
+    if (local_bin / "agy").exists() and str(local_bin) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(local_bin)
+
+
 def sync_agents() -> None:
     for table, value in ((PROVIDERS, "binary"), (LABELS, "label"), (INSTALL, "install"), (SIGN_IN, "sign_in"),
                          (SESSION_NAMES, "name")):
@@ -61,7 +75,7 @@ def sync_agents() -> None:
         table.update({agent.id: getattr(agent, value) for agent in AGENTS.values()})
 
 
-sync_agents()
+seat_gemini()
 # The dashboard goes to stderr so stdout carries only the answer and can be piped or redirected.
 console = Console(stderr=True)
 _running: set[subprocess.Popen] = set()
@@ -156,11 +170,13 @@ class Settings:
     cross_examine: bool = True  # advisers critique each other's opinions before the verdict
     advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS
     split: str = "auto"  # "auto": Claude splits big tasks into subtasks; "always" or "never"
+    gemini: str = "auto"  # the tool behind the Gemini seat: "antigravity", "gemini-cli", or "auto"
 
 
 def load_config(path: Path) -> Settings:
-    """Read [models], [ui] and [sessions] from the config file."""
+    """Read [models], [ui], [sessions], [council], [gemini] and [agents] from the config file."""
     if not path.exists():
+        seat_gemini()
         return Settings()
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -175,7 +191,11 @@ def load_config(path: Path) -> Settings:
         if not isinstance(spec, dict):
             raise ValueError(f"[agents.{agent_id}] in {path} must be a table")
         AGENTS[agent_id] = conclave_agents.custom(agent_id, spec)
-    sync_agents()
+    gemini = data.get("gemini", {})
+    tool = gemini.get("cli", "auto") if isinstance(gemini, dict) else None
+    if tool not in conclave_agents.GEMINI_TOOLS:
+        raise ValueError(f"[gemini] cli in {path} must be \"antigravity\", \"gemini-cli\" or \"auto\"")
+    seat_gemini(tool)
     models = data.get("models", {})
     if not isinstance(models, dict):
         raise ValueError(f"[models] in {path} must be a table")
@@ -207,7 +227,8 @@ def load_config(path: Path) -> Settings:
     split = council.get("split", "auto")
     if split not in ("auto", "always", "never"):
         raise ValueError(f"[council] split in {path} must be \"auto\", \"always\" or \"never\"")
-    return Settings(selected, theme, sessions.get("save", True), council.get("cross_examine", True), advisers, split)
+    return Settings(selected, theme, sessions.get("save", True), council.get("cross_examine", True), advisers, split,
+                    tool)
 
 
 def load_models(path: Path) -> dict[str, str]:
@@ -257,6 +278,18 @@ def command_for(provider: str, prompt: str, model: str | None, structured: bool 
         if model:
             cmd += ["--model", model]
         return cmd, prompt
+    if provider == "gemini" and AGENTS["gemini"].reader == "antigravity":
+        # Antigravity CLI takes the prompt as a flag (--prompt=… so a leading dash can't be read as an option). In
+        # headless runs it never prompts: tools that need an approval the mode doesn't give are skipped. `plan`
+        # overrides any default mode in its settings, so a read-only call stays read-only.
+        mode = {"read": ["--mode", "plan"], "edit": ["--mode", "accept-edits"],
+                "full": ["--mode", "accept-edits", "--dangerously-skip-permissions"]}[access]
+        cmd = ["agy", f"--prompt={prompt}", "--output-format", "stream-json" if structured else "text", *mode]
+        if session and session.resume:
+            cmd += ["--conversation", session.id]
+        if model:
+            cmd += ["--model", model]
+        return cmd, None
     if provider == "gemini":
         # Piped stdin puts Gemini in headless mode and avoids argv length limits on long prompts.
         approval = {"read": "plan", "edit": "auto_edit", "full": "yolo"}[access]
@@ -323,6 +356,8 @@ def configured_model(agent: str) -> str:
 
     if agent == "claude":
         return os.environ.get("ANTHROPIC_MODEL") or json_key(home / ".claude" / "settings.json", "model")
+    if agent == "gemini" and AGENTS["gemini"].reader == "antigravity":
+        return json_key(home / ".gemini" / "antigravity-cli" / "settings.json", "model")
     if agent == "gemini":
         return os.environ.get("GEMINI_MODEL") or json_key(home / ".gemini" / "settings.json", "model")
     if agent == "qwen":
@@ -424,7 +459,8 @@ class Stream:
             return
         self.events += 1
         reader = AGENTS[self.provider].reader
-        {"claude": self._claude, "gemini": self._gemini, "codex": self._codex}.get(reader, lambda _event: None)(event)
+        {"claude": self._claude, "gemini": self._gemini, "codex": self._codex,
+         "antigravity": self._antigravity}.get(reader, lambda _event: None)(event)
 
     def saw_model(self, model) -> None:
         if isinstance(model, str) and model:
@@ -501,6 +537,38 @@ class Stream:
             else:
                 self.final = self.text
 
+    def _antigravity(self, event: dict) -> None:
+        """Antigravity CLI's stream-json: init, then step_update events (text deltas and tool steps), then result."""
+        kind = event.get("type") or event.get("event")
+        body = {**event, **(event.get("payload") if isinstance(event.get("payload"), dict) else {})}
+        if body.get("conversation_id"):
+            self.session_id = str(body["conversation_id"])
+        if kind == "init":
+            self.saw_model(body.get("model"))
+        elif kind == "step_update":
+            step, sort = body.get("step_index"), body.get("step_type")
+            if sort == "agent_response":
+                if step != getattr(self, "_step", None):
+                    self._step, self.text = step, ""  # each response step is a fresh draft; result has the answer
+                if body.get("text_delta"):
+                    self.text += str(body["text_delta"])
+                    self.activity = "writing"
+            elif sort == "tool" and body.get("state") != "DONE":
+                info = body.get("tool_info") if isinstance(body.get("tool_info"), dict) else {}
+                name = body.get("tool_name") or info.get("name") or "a tool"
+                self.activity = f"using {name}"
+        elif kind == "result":
+            usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+            self.tokens_in = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_tokens") or 0)
+            self.tokens_out = int(usage.get("output_tokens") or 0) + int(usage.get("thinking_tokens") or 0)
+            if body.get("status", "SUCCESS") != "SUCCESS":
+                error = body.get("error")
+                if isinstance(error, dict):
+                    error = error.get("message")
+                self.error = str(error or body.get("status"))
+            else:
+                self.final = body.get("response") if isinstance(body.get("response"), str) else self.text
+
     def _codex(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "thread.started":
@@ -544,11 +612,22 @@ class Stream:
             raise RuntimeError(f"{binary}: {self.error}")
         if returncode:
             detail = stderr.strip() or self.last_error or "\n".join(self.plain).strip() or "no details returned"
-            raise RuntimeError(f"{binary} exited with status {returncode}: {detail[-1200:]}")
+            raise RuntimeError(f"{binary} exited with status {returncode}: {tidy_error(detail)}")
         answer = (self.final if self.final is not None else self.live).strip()
         if not answer:
             raise EmptyAnswer(f"{binary} returned an empty answer", structured=self.events > 0)
         return Reply(answer, self.tokens_in, self.tokens_out, self.cost, self.session_id)
+
+
+def tidy_error(detail: str) -> str:
+    """The useful part of a CLI's error output: a stated reason when there is one, without JavaScript stack frames."""
+    reason = re.search(r"(?:reasonMessage|message)['\"]?\s*[:=]\s*['\"]([^'\"]{20,})['\"]", detail)
+    if reason:
+        return reason.group(1).strip()
+    lines = [line for line in detail.splitlines()
+             if line.strip() and not re.match(r"\s*at\s+\S+.*[(:]\d+|\s*at\s+(file|node):", line)]
+    text = "\n".join(lines[-8:])
+    return text[-800:]
 
 
 def stop(proc: subprocess.Popen) -> None:
@@ -698,8 +777,8 @@ def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch,
     reply = stream.reply(binary, proc.returncode, "".join(errors))
     if not session:
         reply.session_id = ""  # Codex reports a thread id even for an --ephemeral run, but nothing was saved
-    elif not reply.session_id and provider != "openai":
-        reply.session_id = session.id  # Claude and Gemini use the id Conclave chose; Codex reports its own
+    elif not reply.session_id and AGENTS[provider].reader in ("claude", "gemini"):
+        reply.session_id = session.id  # Claude and Gemini CLI use the id Conclave chose; Codex and Antigravity report theirs
     return reply
 
 
@@ -871,6 +950,9 @@ class Tail:
 
 def fix_for(provider: str, error: str) -> str:
     lower = error.lower()
+    if "no longer supported for gemini code assist" in lower or "migrate to the antigravity" in lower:
+        return ("Google no longer lets personal accounts use Gemini CLI. Install Antigravity CLI, its replacement: "
+                f"`{conclave_agents.ANTIGRAVITY_INSTALL}`, run `agy` once to sign in, and Conclave uses it for Gemini.")
     if "not installed" in lower:
         return INSTALL[provider]
     if any(word in lower for word in ("authenticat", "oauth", "log in", "login", "logged in", "sign in", "signed in", "sign-in",
@@ -1856,6 +1938,8 @@ def check(provider: str) -> Health:
     elif provider == "openai":
         status = quiet(["codex", "login", "status"])
         health.signed_in = None if status is None else status.returncode == 0
+    elif provider == "gemini" and AGENTS["gemini"].reader == "antigravity":
+        health.signed_in = None  # Antigravity keeps its sign-in in the system keychain, with no status command
     elif provider == "gemini":
         health.signed_in = gemini_signed_in()
     elif provider == "ollama":
@@ -1911,12 +1995,14 @@ def setup(ask_first: bool, members: tuple[str, ...] = ("claude", *conclave_agent
             if not agent.install_command:
                 console.print(f"  {agent.install}")
                 continue
-            if not shutil.which("npm"):
+            if agent.install_command.startswith("npm ") and not shutil.which("npm"):
                 console.print(f"  [{BAD}]npm is missing.[/] Install Node.js (https://nodejs.org, or `brew install node`), "
                               "then run /setup again.")
                 break
             if confirm(f"Install {agent.name} now?"):
-                if run_visible(agent.install_command) == 0 and agent.sign_in_command and confirm(f"Sign in to {agent.name} now?"):
+                installed = run_visible(agent.install_command) == 0
+                add_local_bin()
+                if installed and agent.sign_in_command and confirm(f"Sign in to {agent.name} now?"):
                     run_visible(agent.sign_in_command)
         elif health.signed_in is False and agent.sign_in_command and confirm(f"Sign in to {agent.name} now?"):
             if agent.sign_in_command == agent.binary:
@@ -2749,6 +2835,27 @@ def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bo
     return 0
 
 
+SUBCOMMANDS = ("app", "setup", "update", "install-app", "uninstall-app")
+LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / "io.github.shrestha-droid.conclave.plist"
+
+
+def update() -> int:
+    """Reinstall Conclave from where pipx got it, then restart the always-on app so it runs the new version."""
+    if not shutil.which("pipx"):
+        print("Conclave updates through pipx, which isn't on your PATH. Reinstall the way you installed it, e.g.:\n"
+              "  pipx install --force \"git+https://github.com/shrestha-droid/conclave.git\"", file=sys.stderr)
+        return 1
+    print(f"✦ Updating Conclave (now {__version__})…")
+    if run_visible("pipx reinstall conclave-cli"):
+        return 1
+    if LAUNCH_AGENT.exists() and shutil.which("conclave"):
+        print("✦ Restarting the always-on app with the new version…")
+        run_visible("conclave --install-app")
+    version = subprocess.run(["conclave", "--version"], capture_output=True, text=True).stdout.strip() if shutil.which("conclave") else ""
+    print(f"✦ Up to date{': ' + version if version else ''}.")
+    return 0
+
+
 def main() -> int:
     global ANIMATE
     parser = argparse.ArgumentParser(
@@ -2791,10 +2898,18 @@ def main() -> int:
     parser.add_argument("--install-app", action="store_true",
                         help="add Conclave.app to ~/Applications and keep Conclave running at http://localhost:8765 (macOS)")
     parser.add_argument("--uninstall-app", action="store_true", help="remove Conclave.app and stop it starting at login (macOS)")
+    parser.add_argument("--update", action="store_true",
+                        help="update Conclave to the latest version (and restart the always-on app if it's installed)")
     parser.add_argument("--no-animation", action="store_true", help="skip the start-up animation")
     parser.add_argument("task", nargs="*", help="the task for Claude and its advisers (or pipe it on stdin); "
                         "leave it out to open an interactive session")
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    # `conclave app`, `conclave setup` and the like work as well as the flags, since that's what people type.
+    if len(argv) == 1 and argv[0] in SUBCOMMANDS:
+        argv = [f"--{argv[0]}"]
+    args = parser.parse_args(argv)
+    if args.update:
+        return update()
     if args.timeout < 1:
         parser.error("--timeout must be at least 1")
     if args.agent:

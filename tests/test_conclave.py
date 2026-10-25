@@ -32,6 +32,16 @@ import conclave_agents  # noqa: E402
 import conclave_app  # noqa: E402
 import conclave_context  # noqa: E402
 
+
+
+@pytest.fixture(autouse=True)
+def gemini_cli_seat():
+    """Tests in this process use Gemini CLI for the Gemini seat (loading a config re-picks it); Antigravity CLI has
+    its own tests."""
+    conclave.seat_gemini("gemini-cli")
+    yield
+    conclave.seat_gemini("gemini-cli")
+
 FAKE_CLAUDE = """
 import json, os, sys
 from pathlib import Path
@@ -212,8 +222,10 @@ def write_conversation(claude_home: Path, project: Path, session: str = "abc1234
 
 
 def env_for(bin_dir: Path, tmp_path: Path, **extra) -> dict:
-    return dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", XDG_CONFIG_HOME=str(tmp_path / "config"),
-                XDG_STATE_HOME=str(tmp_path / "state"), CLAUDE_CONFIG_DIR=str(tmp_path / "claude-home"), **extra)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", XDG_CONFIG_HOME=str(tmp_path / "config"),
+               XDG_STATE_HOME=str(tmp_path / "state"), CLAUDE_CONFIG_DIR=str(tmp_path / "claude-home"))
+    env.update(extra)
+    return env
 
 
 def run_cli(bin_dir: Path, *args: str, stdin: str = "", tmp_path: Path, **extra) -> subprocess.CompletedProcess:
@@ -406,7 +418,7 @@ def test_no_cross_examination_when_an_adviser_fails(fake_bin, tmp_path):
 
 
 def test_setup_reports_each_tool(fake_bin, tmp_path):
-    result = run_cli(fake_bin, "--setup", tmp_path=tmp_path, GEMINI_API_KEY="x")
+    result = run_cli(fake_bin, "setup", tmp_path=tmp_path, GEMINI_API_KEY="x")  # `conclave setup` works like --setup
     assert result.returncode == 0, result.stderr
     assert result.stderr.count("ready") == 3 and "9.9.9 (Claude Code)" in result.stderr
     (fake_bin / "gemini").unlink()
@@ -414,7 +426,85 @@ def test_setup_reports_each_tool(fake_bin, tmp_path):
     missing = subprocess.run([sys.executable, str(ROOT / "conclave.py"), "--setup"], capture_output=True, text=True,
                              timeout=60, env=dict(env_for(fake_bin, tmp_path), PATH=f"{fake_bin}{os.pathsep}{env_path}"))
     assert missing.returncode == 1
-    assert "not installed" in missing.stderr and "npm install -g @google/gemini-cli" in missing.stderr
+    # With neither Gemini tool installed, Gemini is seated through Antigravity CLI, which personal accounts can use.
+    assert "not installed" in missing.stderr and "antigravity.google/cli/install.sh" in re.sub(r"\s+", "", missing.stderr)
+
+
+FAKE_AGY = """
+import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("1.4.4")
+    sys.exit(0)
+prompt = next(a for a in args if a.startswith("--prompt="))[len("--prompt="):]
+if os.environ.get("ARGV_LOG"):
+    open(os.environ["ARGV_LOG"], "a").write(json.dumps(["agy", *[a if not a.startswith("--prompt=") else "--prompt=…" for a in args]]) + "\\n")
+assert "BRIEF: weigh cost against speed" in prompt or "user's request below" in prompt
+def emit(event):
+    print(json.dumps(event), flush=True)
+emit({"type": "init", "cwd": os.getcwd(), "model": "gemini-4-flash", "permission_mode": "plan"})
+emit({"type": "step_update", "conversation_id": "agy-conv-1", "step_index": 0, "step_type": "tool", "state": "ACTIVE", "tool_name": "read_file"})
+emit({"type": "step_update", "conversation_id": "agy-conv-1", "step_index": 0, "step_type": "tool", "state": "DONE", "tool_name": "read_file"})
+for chunk in ("GEMINI ", "SAYS ", "go"):
+    emit({"type": "step_update", "conversation_id": "agy-conv-1", "step_index": 1, "step_type": "agent_response", "state": "ACTIVE", "text_delta": chunk})
+emit({"type": "result", "conversation_id": "agy-conv-1", "status": "SUCCESS", "response": "GEMINI SAYS go",
+      "usage": {"input_tokens": 20, "output_tokens": 10, "thinking_tokens": 5, "cache_read_tokens": 0, "total_tokens": 35}})
+"""
+
+
+def test_gemini_through_antigravity_cli(fake_bin, tmp_path):
+    (fake_bin / "gemini").unlink()
+    install(fake_bin, "agy", FAKE_AGY)
+    log = tmp_path / "argv.log"
+    env_path = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep) if not (Path(p) / "gemini").exists())
+    result = run_cli(fake_bin, "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log), PATH=f"{fake_bin}{os.pathsep}{env_path}")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "FINAL ANSWER (saw gemini, saw codex, saw rebuttals)\n"
+    first = argv_log(log)["agy"][0]
+    assert first[first.index("--mode") + 1] == "plan" and "stream-json" in first and "--dangerously-skip-permissions" not in first
+    assert f"continue in Antigravity CLI: cd {tmp_path} && agy --conversation agy-conv-1" in re.sub(r"\s+", " ", result.stderr)
+
+    result = run_cli(fake_bin, "--agent", "gemini", "--access", "full", "Fix it", tmp_path=tmp_path, ARGV_LOG=str(log),
+                     PATH=f"{fake_bin}{os.pathsep}{env_path}")
+    assert result.stdout == "GEMINI SAYS go\n", result.stderr
+    full = argv_log(log)["agy"][-1]
+    assert "--dangerously-skip-permissions" in full and full[full.index("--mode") + 1] == "accept-edits"
+
+
+def test_cli_errors_are_tidied():
+    trace = ("V6U.js:312319:11)\n    at _doSetupUser (file:///opt/homebrew/lib/node_modules/x.js:1:5)\n"
+             "  ineligibleTiers: [ { reasonCode: 'UNSUPPORTED_CLIENT',\n"
+             "      reasonMessage: 'This client is no longer supported for Gemini Code Assist for individuals.',\n")
+    assert conclave.tidy_error(trace) == "This client is no longer supported for Gemini Code Assist for individuals."
+    assert conclave.tidy_error("Error: boom\n    at foo (x.js:1:2)\n    at node:internal/y") == "Error: boom"
+
+
+def test_update_needs_pipx(fake_bin, tmp_path):
+    result = run_cli(fake_bin, "update", tmp_path=tmp_path, PATH=str(fake_bin))
+    assert result.returncode == 1 and "pipx" in result.stderr
+
+
+def test_choosing_the_gemini_tool(tmp_path):
+    try:
+        conclave.seat_gemini("antigravity")
+        resume = conclave.SessionPlan("c-1", resume=True)
+        argv, stdin = conclave.command_for("gemini", "-starts with a dash", "gemini-4-pro", session=resume, access="edit")
+        assert argv[:2] == ["agy", "--prompt=-starts with a dash"] and stdin is None
+        assert argv[-4:] == ["--conversation", "c-1", "--model", "gemini-4-pro"]
+        assert conclave.SESSION_NAMES["gemini"] == "Antigravity CLI"
+        stream = feed("gemini", [{"type": "result", "status": "ERROR", "error": {"message": "authentication required"}}])
+        assert "authentication required" in stream.error
+        assert "agy" in conclave.fix_for("gemini", "Failed to sign in. Message: This client is no longer supported for "
+                                         "Gemini Code Assist for individuals.")
+        config = tmp_path / "config.toml"
+        config.write_text('[gemini]\ncli = "gemini-cli"\n')
+        conclave.load_config(config)
+        assert conclave.PROVIDERS["gemini"] == "gemini"
+        config.write_text('[gemini]\ncli = "bard"\n')
+        with pytest.raises(ValueError):
+            conclave.load_config(config)
+    finally:
+        conclave.seat_gemini("gemini-cli")
 
 
 FAKE_ECHO = """

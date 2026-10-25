@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "conclave-cli"
 dynamic = ["version"]
-description = "Bring Claude Code projects and conversations to a council: Claude leads, Gemini and Codex advise"
+description = "Bring Claude Code projects and conversations to a council: Claude leads, Gemini and ChatGPT advise"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["rich>=13.9", "prompt_toolkit>=3.0.43"]

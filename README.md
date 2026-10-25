@@ -6,7 +6,7 @@ You can also skip the council and work with one agent, the way you would in Clau
 
 It works on any question too, and you can pick the model for each agent. You can seat more advisers (Qwen Code, GitHub Copilot CLI, OpenCode, Ollama, or any command-line AI you add), and for a big task Claude can split the work into subtasks and hand each to the agent best suited to it.
 
-Conclave coordinates the Claude Code, Gemini CLI and Codex command-line tools you already have and are signed in to. It doesn't replace them, and their account rules and usage limits apply.
+Conclave coordinates the Claude Code, Antigravity (or Gemini) and Codex command-line tools you already have and are signed in to. It doesn't replace them, and their account rules and usage limits apply.
 
 **About ChatGPT:** ChatGPT has no command-line tool of its own, so Conclave reaches it through Codex, OpenAI's coding agent. You sign in to Codex with your ChatGPT account and it runs ChatGPT's GPT models on your ChatGPT plan, which is why Conclave calls it ChatGPT. It is the coding agent, not the chat app: rounds don't appear in your chatgpt.com history, and your ChatGPT memory and custom GPTs aren't used. It can read the project and run commands, which the chat app can't.
 
@@ -14,19 +14,26 @@ Conclave coordinates the Claude Code, Gemini CLI and Codex command-line tools yo
 
 - Python 3.11 or newer
 - Claude Code CLI (`claude`), signed in
-- Gemini CLI (`gemini`), signed in (needs Node.js 20 or newer)
+- Antigravity CLI (`agy`) for Gemini, signed in with your Google account
 - Codex CLI (`codex`), signed in with your ChatGPT account (this is ChatGPT in Conclave)
 
 Run each of these lines on its own in Terminal. Copy only the command, not any words before it:
 
 ```sh
-npm install -g @google/gemini-cli
-gemini
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy
 npm install -g @openai/codex@latest
 codex login
 ```
 
-`gemini` opens Gemini CLI so you can choose a sign-in method; quit it afterwards. For `codex login`, choose **Sign in with ChatGPT**. If `npm` isn't found, install Node.js first (`brew install node`, or from nodejs.org). Or skip all of this: run `conclave`, type `/setup`, and Conclave installs and signs in to each tool for you.
+`agy` opens Antigravity CLI so you can sign in with Google; quit it afterwards. For `codex login`, choose **Sign in with ChatGPT**.
+
+**Why Antigravity and not Gemini CLI:** on 18 June 2026 Google stopped serving Gemini CLI to personal accounts (free, Google AI Pro and Ultra), which now get "This client is no longer supported for Gemini Code Assist for individuals". Antigravity CLI is Google's replacement, and Conclave uses it for the Gemini seat whenever `agy` is installed. Gemini CLI still works with a paid Gemini API key or a Code Assist Standard or Enterprise licence; to keep using it, add this to the config:
+
+```toml
+[gemini]
+cli = "gemini-cli"     # or "antigravity"; the default "auto" prefers Antigravity
+``` If `npm` isn't found, install Node.js first (`brew install node`, or from nodejs.org). Or skip all of this: run `conclave`, type `/setup`, and Conclave installs and signs in to each tool for you.
 
 Claude Code installation and sign-in steps are in the [Claude Code docs](https://code.claude.com/docs/en/quickstart).
 
@@ -36,7 +43,9 @@ Claude Code installation and sign-in steps are in the [Claude Code docs](https:/
 pipx install git+https://github.com/shrestha-droid/conclave.git
 ```
 
-Install pipx with the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html). To update later, run the same command with `--force`. From a clone, `pipx install .` works too.
+Install pipx with the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html). From a clone, `pipx install .` works too.
+
+To update, run `conclave update`. It reinstalls the latest version from where you installed it, and restarts the always-on app so the page at localhost:8765 shows the new version too. `conclave app`, `conclave setup` and `conclave install-app` work as well as the `--app`, `--setup` and `--install-app` flags.
 
 ## The app
 
@@ -44,7 +53,7 @@ Install pipx with the [pipx installation guide](https://pipx.pypa.io/latest/how-
 conclave --app
 ```
 
-This opens Conclave in your browser. The sidebar lists every project you have used Claude Code in, and each project's conversations show how many errors they hit. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, drawn in its maker's colours: Claude in clay with soft corners, Gemini in its blue-to-purple frame, ChatGPT in black and green. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
+This opens Conclave in your browser, drawn the way the terminal is: monospace, frames with their titles set into the border, the block-letter banner, and each agent's box in its maker's colours. The sidebar lists every project you have used Claude Code in, and each project's conversations show how many errors they hit. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, as in the terminal: Claude in clay with rounded corners, Gemini blue with a double frame, ChatGPT green and square. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
 
 **Send to** picks who gets the question: the whole council, or one agent. With one agent you also choose its access (**Read**, **Edit** or **Full**, explained below), and follow-ups carry on that agent's conversation.
 
@@ -75,11 +84,21 @@ This keeps Conclave running in the background from the moment you log in, always
 
 On Linux and Windows, run `conclave --app` when you want it.
 
+### Sharing it: everyone runs their own
+
+Conclave is meant to be installed on each laptop that uses it, not hosted once for everyone. Each person installs it with the pipx command above (the repository has to be public, or they need access to it) and signs in to the tools with their own accounts:
+
+- **With a subscription:** Claude Code with a Claude plan, Antigravity CLI with a Google account, Codex with a ChatGPT plan.
+- **With API keys instead:** Claude Code reads `ANTHROPIC_API_KEY`; Codex signs in with `codex login --with-api-key`; Gemini CLI reads `GEMINI_API_KEY` (set `[gemini] cli = "gemini-cli"`). Each is billed per use to that person's key.
+- **With anything else:** any command-line AI they have can join through `[agents.<name>]` in the config, Ollama included for a free local model.
+
+Each person picks their own access level: you might give hand-offs full access on your laptop, while someone else keeps theirs read-only. Don't share your own sign-ins with other people; Claude, ChatGPT and Google accounts are for one person each.
+
 ### Why it isn't hosted on Vercel
 
 Conclave runs on your computer on purpose. It uses the `claude`, `gemini` and `codex` tools you're already signed in to, so it costs nothing beyond your subscriptions. It also reads your Claude Code conversations and project files from your disk. A hosted site can do neither: it would need separately billed API keys, and you'd have to upload conversations and code to it.
 
-The app only listens on 127.0.0.1, and it only answers requests that carry a secret token from the page it served. That stops other websites from starting rounds. The page loads its typefaces (Instrument Serif, Inter and JetBrains Mono) from Google Fonts; offline it falls back to your system fonts.
+The app only listens on 127.0.0.1, and it only answers requests that carry a secret token from the page it served. That stops other websites from starting rounds. The page loads its typeface (JetBrains Mono) from Google Fonts; offline it falls back to your system's monospace font.
 
 ## In the terminal
 
@@ -160,11 +179,13 @@ And add a regression test for it.
 
 `/to claude` sends everything to Claude, and each message carries on the same Claude Code session, so it remembers the work so far, just as in Claude Code (it shows up in `claude --resume` too). `@council` brings in the whole council for one question when you want a second opinion. `/apply` has an agent carry out the verdict. `/new` starts fresh conversations.
 
-| Access | What the agent may do | Claude Code | Gemini CLI | ChatGPT (Codex) |
-| --- | --- | --- | --- | --- |
-| `read` (default) | read the project; change nothing | plan mode | plan mode | read-only sandbox |
-| `edit` | edit files in the project | accept edits | auto-edit | workspace-write sandbox (may run commands inside the project) |
-| `full` | edit files and run any command on this computer, without asking | skip permissions | yolo | no sandbox |
+| Access | What the agent may do | Claude Code | Gemini (Antigravity CLI) | Gemini CLI | ChatGPT (Codex) |
+| --- | --- | --- | --- | --- | --- |
+| `read` (default) | read the project; change nothing | plan mode | plan mode | plan mode | read-only sandbox |
+| `edit` | edit files in the project | accept edits | accept-edits | auto-edit | workspace-write sandbox (may run commands inside the project) |
+| `full` | edit files and run any command on this computer, without asking | skip permissions | skip permissions | yolo | no sandbox |
+
+Antigravity CLI never stops to ask in a headless run: a step the mode doesn't allow is skipped. Rules you've added to its own `permissions.allow` setting still apply at every level.
 
 Qwen Code, Copilot CLI and OpenCode get their own equivalents. The council itself always runs read-only; access applies to hand-offs and `/apply`.
 
@@ -194,19 +215,19 @@ strengths = "small local model, private"
 
 **Splitting.** With `split = "auto"` (the default), Claude decides as it reads the task. A big task that splits into independent parts becomes a plan of 2 to 6 subtasks, each given to the adviser whose strengths fit it. Each adviser works through its own subtasks, all of them at the same time, and Claude combines the results. Use `--split always|never` or `/split` to choose.
 
-## Your rounds in Claude Code, Gemini CLI and Codex
+## Your rounds in Claude Code, Antigravity and Codex
 
 Each round is also saved in each model's own tool, so you can carry on with any of them there:
 
 - **Claude Code:** the brief and the verdict are one session named "Conclave · your question". It appears in `claude --resume`, and Conclave's conversation list shows it too.
-- **Gemini CLI:** the opinion is a session you can open with `gemini --resume <id>`.
+- **Antigravity CLI:** the opinion is a conversation you can open with `agy --conversation <id>` (with Gemini CLI, `gemini --resume <id>`).
 - **Codex:** the opinion is kept, and `codex resume <id>` opens it. Codex uses your ChatGPT account.
 
 After each verdict Conclave shows the exact command for each. In the app, **Continue in** buttons open a Terminal window already in that session (on a Mac; elsewhere they copy the command). In the terminal, use `/continue codex` and the like.
 
 claude.ai, gemini.google.com and chatgpt.com don't let any app add conversations to your history, so rounds can't appear there.
 
-Use `--private` for one run, `/private` in a session, the app's **Save sessions** switch, or `[sessions] save = false` in the config, and Claude Code and Codex keep no session. Gemini CLI always keeps its own session history.
+Use `--private` for one run, `/private` in a session, the app's **Save sessions** switch, or `[sessions] save = false` in the config, and Claude Code and Codex keep no session. Antigravity and Gemini CLI always keep their own history.
 
 ## Settings
 
@@ -234,7 +255,7 @@ Flags such as `--claude-model`, `--chatgpt-model`, `--theme` and `--timeout` ove
 
 ## What gets sent where
 
-Your question, and anything you attach, goes to Anthropic, Google and OpenAI through their CLIs: the condensed conversation, the project's git state and diff, and earlier answers in the session. The models can also read files in the project folder. Don't attach a conversation or project you wouldn't share with all three.
+Your question, and anything you attach, goes to Anthropic, Google and OpenAI through their CLIs (Claude Code, Antigravity CLI or Gemini CLI, and Codex): the condensed conversation, the project's git state and diff, and earlier answers in the session. The models can also read files in the project folder. Don't attach a conversation or project you wouldn't share with all three.
 
 In council rounds all three run read-only: Claude in plan mode, Gemini in plan approval mode and Codex in a read-only sandbox. Hand-offs and `/apply` run at the access you choose (see above). Gemini CLI uses its default approval mode in folders you haven't trusted. In non-interactive runs it still can't edit files or run shell commands without approval. Conclave itself writes only what you ask for (`.conclave/verdict-*.md` on hand-back, and files you name with `/save`, `/export` or `--output`), plus its prompt history and app state in `~/.local/state/conclave`. Each round is also saved as sessions in the three tools unless you make it private (see above).
 
