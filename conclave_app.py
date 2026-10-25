@@ -2,7 +2,7 @@
 """The Conclave app: a local web page for bringing Claude Code projects and conversations to the council.
 
 `conclave --app` (or `conclave-app`) starts a small server on 127.0.0.1 and opens it in your browser. Pick a project
-and one of its Claude Code conversations, ask a question, and watch Claude, Gemini and ChatGPT work live. The server only
+and one of its conversations (from Claude Code, Gemini CLI or Codex), ask a question, and watch Claude, Gemini and ChatGPT work live. The server only
 answers requests that carry the token embedded in the page it serves, and only for a localhost Host header.
 """
 
@@ -186,7 +186,7 @@ class App:
         return {
             "project": str(project),
             "conversations": [{"id": c.id, "title": c.title, "when": c.when, "messages": c.messages,
-                               "errors": c.errors, "branch": c.branch}
+                               "errors": c.errors, "branch": c.branch, "tool": c.tool, "toolName": c.tool_name}
                               for c in context.conversations(project)],
         }
 
@@ -633,186 +633,218 @@ PAGE = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#0A0A0C;--panel:#0D0D11;--panel2:#121216;--edge:#1B1B20;--edge2:#26262C;--accent:#E50914;--accent2:#FF6B73;--muted:#77756F;
---text:#E6E3DC;--soft:#A9A69F;--good:#4ADE80;--warn:#FFB547;--bad:#FF9F43;
+:root{--ink:#05060B;--panel:#0A0C13;--panel2:#10121B;--edge:#1A1D2A;--edge2:#262A3A;--accent:#8B88F0;--accent2:#A5A3FF;--muted:#8B91A7;
+--text:#ECEFF7;--soft:#C3C8D8;--good:#8BE9A8;--warn:#F0C878;--bad:#FF6B7A;
 --claude:#D97757;--gemini:#4F8FF7;--openai:#10A37F;--qwen:#7C6CF2;--copilot:#A371F7;--opencode:#FAB283;--ollama:#E5E5E5;
---mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+--mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;--r:6px}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--ink);color:var(--soft);font:13px/1.6 var(--mono)}
+body{background:radial-gradient(900px 420px at 80% -8%,color-mix(in srgb,var(--accent) 7%,transparent),transparent 70%),var(--ink)}
 button,input,textarea,select{font:inherit;color:inherit}
 a{color:var(--text)}
 ::selection{background:color-mix(in srgb,var(--accent) 35%,transparent)}
-.app{display:grid;grid-template-columns:280px 1fr;grid-template-rows:auto 1fr;height:100vh}
+.app{display:grid;grid-template-columns:300px 1fr;grid-template-rows:auto 1fr;height:100vh}
 .dim{color:var(--muted)}
-.label{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:lowercase;margin:0 0 8px}
+.label{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin:0 0 10px}
+.label::before{content:"";width:6px;height:6px;background:var(--accent)}
 
-header{grid-column:1/-1;display:flex;align-items:center;gap:20px;padding:12px 22px;border-bottom:1px solid var(--edge)}
-.logo{color:var(--text);font-weight:500;white-space:nowrap}
+header{grid-column:1/-1;display:flex;align-items:center;gap:18px;padding:12px 22px;border-bottom:1px solid var(--edge);background:color-mix(in srgb,var(--ink) 85%,transparent);backdrop-filter:blur(8px)}
+.logo{display:flex;align-items:center;gap:9px;color:var(--text);font-weight:700;letter-spacing:.02em;white-space:nowrap}
+.logo::before{content:"";width:9px;height:9px;background:var(--accent);box-shadow:0 0 12px color-mix(in srgb,var(--accent) 60%,transparent)}
 .logo i{color:var(--accent);font-style:normal}
+#minds{white-space:nowrap}
 .spacer{flex:1}
-.pills{display:flex;gap:16px;font-size:12px;min-width:0;overflow:hidden}
-.pill{display:flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap}
-.pill i{width:5px;height:5px;border-radius:50%;background:var(--c)}
-.pill.missing i{background:var(--edge2)}
-.pill b{color:var(--soft);font-weight:400}
-.iconbtn{border:0;background:none;padding:2px 4px;cursor:pointer;color:var(--muted)}
-.iconbtn:hover{color:var(--text)}
+.pills{display:flex;gap:8px;font-size:12px;min-width:0;overflow:hidden}
+.pill{display:flex;align-items:center;gap:7px;color:var(--soft);white-space:nowrap;padding:3px 10px;border:1px solid var(--edge);border-radius:999px;background:var(--panel)}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--c);box-shadow:0 0 6px var(--c)}
+.pill.missing i{background:var(--edge2);box-shadow:none}
+.pill b{color:var(--muted);font-weight:400}
+.iconbtn{border:1px solid var(--edge);background:var(--panel);border-radius:var(--r);padding:3px 10px;cursor:pointer;color:var(--soft)}
+.iconbtn:hover{color:var(--text);border-color:var(--edge2)}
+select.field{width:auto;border:1px solid var(--edge);border-radius:var(--r);background:var(--panel);color:var(--soft);padding:3px 8px;cursor:pointer}
 
-
-aside{border-right:1px solid var(--edge);overflow:auto;padding:20px 14px 30px;display:flex;flex-direction:column;gap:26px}
-.list{display:flex;flex-direction:column}
-.item{padding:5px 8px;cursor:pointer;border-left:1px solid transparent}
-.item:hover{color:var(--text)}
-.item.on{border-left-color:var(--accent);color:var(--text)}
-.item .n{display:none}
+aside{border-right:1px solid var(--edge);overflow:auto;padding:20px 14px 30px;display:flex;flex-direction:column;gap:24px;background:color-mix(in srgb,var(--panel) 55%,transparent)}
+.list{display:flex;flex-direction:column;gap:2px}
+.item{padding:6px 8px;cursor:pointer;border-radius:var(--r)}
+.item:hover{background:var(--panel2);color:var(--text)}
 .item .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.item .s{color:var(--muted);font-size:11px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item .s{color:var(--muted);font-size:11px;white-space:nowrap}
 .err{color:var(--bad)}
-.field{width:100%;padding:6px 8px;border:1px solid var(--edge);background:transparent;outline:none;border-radius:0}
+.field{width:100%;padding:7px 10px;border:1px solid var(--edge);border-radius:var(--r);background:var(--ink);outline:none}
 .field:focus{border-color:var(--edge2)}
 .empty{color:var(--muted);font-size:12px;padding:4px 8px}
-select.field{width:auto;border:0;background:none;color:var(--muted);padding:0;cursor:pointer;-webkit-appearance:none;appearance:none}
-#minds{white-space:nowrap}
+.proj > .item{display:flex;gap:8px;align-items:baseline}
+.proj > .item .tw{color:var(--muted);width:1ch;flex:none}
+.proj > .item .t{flex:1}
+.proj.open > .item{background:color-mix(in srgb,var(--accent) 9%,var(--panel));color:var(--text)}
+.proj.open > .item .tw{color:var(--accent)}
+.tree{margin:4px 0 10px 12px;border-left:1px solid var(--edge2)}
+.ftabs{display:flex;gap:6px;padding:4px 0 8px 12px;font-size:11px;flex-wrap:wrap;animation:scaffold .25s ease both}
+.ftab{cursor:pointer;color:var(--muted);padding:1px 8px;border:1px solid var(--edge);border-radius:999px}
+.ftab:hover{color:var(--soft)}
+.ftab.on{color:var(--c,var(--text));border-color:color-mix(in srgb,var(--c,var(--text)) 50%,var(--edge));background:color-mix(in srgb,var(--c,var(--text)) 10%,transparent)}
+.ftab b{font-weight:400;color:var(--muted);margin-left:4px}
+.leaf{position:relative;margin:1px 0 1px 10px;padding:5px 8px;border-radius:var(--r);cursor:pointer;animation:scaffold .3s ease both;animation-delay:calc(var(--i) * 35ms)}
+.leaf::before{content:"";position:absolute;left:-10px;top:15px;width:8px;border-top:1px solid var(--edge2)}
+.leaf:hover{background:var(--panel2)}
+.leaf .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--soft)}
+.leaf .t i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--c);margin-right:8px;vertical-align:1px}
+.leaf .s{color:var(--muted);font-size:11px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;padding-left:14px}
+.leaf:hover .t,.leaf.on .t{color:var(--text)}
+.leaf.on{background:color-mix(in srgb,var(--c) 11%,var(--panel));box-shadow:inset 2px 0 0 var(--c)}
+@keyframes scaffold{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
 
 main{overflow:auto;padding:28px 34px 80px}
-.wrap{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:30px}
-.hello h1{font:500 18px/1.4 var(--mono);color:var(--text);margin:0 0 6px}
+.wrap{max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:26px}
+.hello{display:flex;gap:24px;align-items:center;padding:6px 2px}
+.crowd{display:flex;gap:10px}
+.crowd .sprite{width:42px;height:36px;animation:float 2.8s ease-in-out infinite}
+.crowd .sprite:nth-child(2n){animation-delay:-1.4s}
+@keyframes float{50%{transform:translateY(-4px)}}
+.hello h1{font:700 20px/1.3 var(--mono);color:var(--text);margin:0 0 4px}
 .hello h1 i{color:var(--accent);font-style:normal}
 .hello p{margin:0;color:var(--muted);max-width:640px}
 
-.composer{border:1px solid var(--edge);padding:16px 18px}
-.chips{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px;font-size:12px}
-.chip{display:inline-flex;align-items:center;gap:6px;color:var(--muted);max-width:100%}
+.composer{border:1px solid var(--edge2);border-radius:10px;background:linear-gradient(180deg,var(--panel2),var(--panel));padding:16px 18px;box-shadow:0 18px 50px -30px color-mix(in srgb,var(--accent) 40%,transparent)}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;font-size:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;color:var(--muted);max-width:100%;padding:2px 10px;border:1px solid var(--edge);border-radius:999px;background:var(--ink)}
 .chip span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chip.live span{color:var(--soft)}
+.chip.live{color:var(--soft);border-color:var(--edge2)}
+.chip.live span{color:var(--text)}
 .chip button{border:0;background:none;color:var(--muted);cursor:pointer;padding:0}
-.chip button:hover{color:var(--text)}
-.tabs{display:flex;gap:4px 16px;flex-wrap:wrap;align-items:baseline;margin-bottom:10px}
-.tabs .k{color:var(--muted);font-size:11px;width:56px}
-.dest,.seat{cursor:pointer;color:var(--muted);border-bottom:1px solid transparent;padding-bottom:1px}
-.dest:hover,.seat:hover{color:var(--soft)}
-.dest.on{color:var(--c);border-bottom-color:var(--c)}
-.dest.council.on{--c:var(--text)}
-.seat.on{color:var(--c)}
-.seat.on::before{content:"● ";font-size:9px;vertical-align:1px}
-.seat:not(.on)::before{content:"○ ";font-size:9px;vertical-align:1px}
-.dest.absent,.seat.absent{opacity:.45}
+.chip button:hover{color:var(--accent)}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.tabs .k{color:var(--muted);font-size:11px;width:62px;text-transform:uppercase;letter-spacing:.1em}
+.dest,.seat{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--muted);padding:2px 10px 2px 5px;border:1px solid var(--edge);border-radius:999px;background:var(--ink);font-size:12px}
+.dest .sprite,.seat .sprite{width:16px;height:14px;filter:grayscale(.7);opacity:.6}
+.dest:hover,.seat:hover{color:var(--soft);border-color:var(--edge2)}
+.dest.on,.seat.on{color:var(--c);border-color:color-mix(in srgb,var(--c) 55%,var(--edge));background:color-mix(in srgb,var(--c) 12%,var(--ink))}
+.dest.on .sprite,.seat.on .sprite{filter:none;opacity:1}
+.dest.council{padding-left:10px}
+.dest.council.on{--c:var(--accent)}
+.dest.absent,.seat.absent{opacity:.4}
 .seat.lead{cursor:default}
-.models{display:flex;gap:6px 20px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
-.models .k{color:var(--muted);font-size:11px;width:56px}
-.mdl{display:inline-flex;align-items:baseline;gap:6px}
+.models{display:flex;gap:6px 10px;flex-wrap:wrap;align-items:center;margin-bottom:4px}
+.models .k{color:var(--muted);font-size:11px;width:62px;text-transform:uppercase;letter-spacing:.1em}
+.mdl{display:inline-flex;align-items:center;gap:6px;padding:2px 4px 2px 10px;border:1px solid var(--edge);border-radius:var(--r);background:var(--ink);font-size:12px}
+.mdl:focus-within{border-color:color-mix(in srgb,var(--c) 60%,var(--edge))}
 .mdl span{color:var(--c)}
-.mdl input{width:auto;min-width:9ch;border:0;border-bottom:1px dashed var(--edge2);background:transparent;padding:0 2px;outline:none;color:var(--soft)}
-.mdl input:focus{border-bottom-color:var(--c);color:var(--text)}
+.mdl input{width:auto;min-width:9ch;border:0;background:transparent;padding:1px 2px;outline:none;color:var(--text)}
 .mdl input::placeholder{color:var(--muted)}
 .prompt{display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--edge);padding-top:12px;margin-top:10px}
-.arrow{color:var(--accent)}
+.arrow{color:var(--accent);font-weight:700}
 .tag{display:none}
-.tag.to{display:inline;color:var(--c)}
+.tag.to{display:inline;color:var(--c);font-weight:700}
 .tag.acc{display:inline;color:var(--warn)}
 .tag.acc.full{color:var(--accent)}
-textarea{flex:1;min-height:78px;resize:vertical;border:0;outline:none;background:transparent;line-height:1.6;color:var(--text)}
+textarea{flex:1;min-height:80px;resize:vertical;border:0;outline:none;background:transparent;line-height:1.6;color:var(--text);font-size:14px}
 textarea::placeholder{color:var(--muted)}
-.row{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;margin-top:8px;font-size:12px}
-.quick{border:0;background:none;padding:0;color:var(--muted);cursor:pointer;text-align:left}
-.quick:hover{color:var(--soft)}
-.access{display:inline-flex;gap:10px;align-items:center}
-.access .k{color:var(--muted)}
-.access button{border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
-.access button.on{color:var(--text);text-decoration:underline;text-underline-offset:4px}
-.access button.on[data-level=edit]{color:var(--warn)}
-.access button.on[data-level=full]{color:var(--accent)}
+.row{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:8px;font-size:12px}
+.quick{border:1px dashed var(--edge2);border-radius:999px;background:none;padding:2px 10px;color:var(--muted);cursor:pointer}
+.quick:hover{color:var(--text);border-color:var(--muted)}
+.access{display:inline-flex;align-items:center;border:1px solid var(--edge);border-radius:var(--r);overflow:hidden}
+.access .k{color:var(--muted);padding:2px 8px}
+.access button{border:0;border-left:1px solid var(--edge);background:var(--ink);padding:2px 10px;cursor:pointer;color:var(--muted)}
+.access button.on{color:var(--text);background:var(--panel2)}
+.access button.on[data-level=edit]{color:#111;background:var(--warn)}
+.access button.on[data-level=full]{color:#fff;background:var(--accent)}
 .access.off{display:none}
-.go{margin-left:auto;border:1px solid var(--edge2);background:none;padding:4px 14px;cursor:pointer;color:var(--text)}
-.go:hover{border-color:var(--accent)}
-.go kbd{font:inherit;color:var(--muted);margin-left:8px}
-details.options summary{cursor:pointer;list-style:none;color:var(--muted)}
+.go{margin-left:auto;border:0;border-radius:var(--r);padding:6px 16px;cursor:pointer;color:var(--ink);background:var(--accent);font-weight:700;box-shadow:0 8px 24px -10px var(--accent)}
+.go:hover{filter:brightness(1.1)}
+.go kbd{font:inherit;opacity:.7;margin-left:8px;font-weight:400}
+details.options summary{cursor:pointer;list-style:none;color:var(--muted);padding:2px 10px;border:1px solid var(--edge);border-radius:var(--r)}
+details.options summary::before{content:"⚙ "}
 details.options[open] summary{color:var(--soft)}
 details.options .row{margin-top:8px}
-details.options input[type=number]{width:7ch;border:0;border-bottom:1px dashed var(--edge2);background:none;outline:none;padding:0 2px}
+details.options input[type=number]{width:7ch;border:1px solid var(--edge);border-radius:4px;background:var(--ink);outline:none;padding:0 4px}
 .toggle{display:flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer}
-.toggle input[type=checkbox]{accent-color:var(--soft)}
+.toggle input[type=checkbox]{accent-color:var(--accent)}
 
-.run{animation:rise .3s ease}
-@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.run{border:1px solid var(--edge);border-radius:10px;background:color-mix(in srgb,var(--panel) 80%,transparent);padding:16px 18px 18px;animation:rise .3s ease}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
 .runhead{display:flex;gap:16px;align-items:baseline}
-.runhead h2{margin:0;font:500 14px/1.5 var(--mono);color:var(--text);flex:1;white-space:pre-wrap}
-.runmeta{display:flex;gap:16px;color:var(--muted);font-size:12px;margin-top:4px;flex-wrap:wrap}
-.clock{color:var(--muted)}
-.tracker{display:flex;align-items:center;gap:10px;margin:12px 0 0;flex-wrap:wrap;font-size:12px;color:var(--edge2)}
-.tracker .bar{width:24px;height:1px;background:var(--edge2)}
-.tracker .bar.on{background:var(--muted)}
-.tracker .ph .n{display:none}
-.tracker .ph{color:var(--edge2)}
-.tracker .ph.on{color:var(--muted)}
-.tracker .ph.now{color:var(--text)}
-.tracker .ph.now::before{content:"● ";color:var(--accent);font-size:9px;vertical-align:1px;animation:pulse 1.2s infinite}
-@keyframes pulse{50%{opacity:.3}}
+.runhead h2{margin:0;font:700 14px/1.5 var(--mono);color:var(--text);flex:1;white-space:pre-wrap}
+.runmeta{display:flex;gap:8px;color:var(--muted);font-size:12px;margin-top:6px;flex-wrap:wrap}
+.runmeta span{padding:0 8px;border:1px solid var(--edge);border-radius:999px}
+.clock{color:var(--accent);font-weight:700}
+.tracker{display:flex;align-items:center;gap:10px;margin:14px 0 0;flex-wrap:wrap;font-size:12px}
+.tracker .bar{flex:0 1 48px;min-width:16px;height:2px;border-radius:2px;background:var(--edge2)}
+.tracker .bar.on{background:var(--accent)}
+.tracker .ph{color:var(--muted)}
+.tracker .ph .n{display:inline-block;min-width:22px;text-align:center;margin-right:6px;padding:0 4px;border-radius:4px;background:var(--panel2);color:var(--muted);font-size:11px}
+.tracker .ph.on{color:var(--soft)}
+.tracker .ph.on .n{background:color-mix(in srgb,var(--good) 18%,var(--panel2));color:var(--good)}
+.tracker .ph.now{color:var(--text);font-weight:700}
+.tracker .ph.now .n{background:var(--accent);color:#fff;animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.55}}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
-.card{--c2:var(--c);--ground:var(--ink);position:relative;border:1px solid color-mix(in srgb,var(--c) 22%,var(--edge));padding:14px 14px 12px;min-height:150px;display:flex;flex-direction:column;gap:6px;transition:border-color .3s}
-.card .ttl{display:flex;gap:6px;font-size:12px}
-.card .ttl .name{color:var(--c)}
-.card .ttl .role{color:var(--muted)}
-.card.working{border-color:color-mix(in srgb,var(--c) 45%,var(--edge))}
-.card.error{border-color:color-mix(in srgb,var(--bad) 45%,var(--edge))}
+.card{--c2:var(--c);--ground:var(--panel2);position:relative;border:1px solid var(--edge);border-top:2px solid color-mix(in srgb,var(--c) 70%,var(--edge));border-radius:8px;background:linear-gradient(180deg,color-mix(in srgb,var(--c) 6%,var(--panel2)),var(--panel));padding:12px 14px;min-height:160px;display:flex;flex-direction:column;gap:8px;transition:border-color .3s,box-shadow .3s}
+.card .ttl{display:flex;gap:8px;align-items:baseline;font-size:12px}
+.card .ttl .name{color:var(--c);font-weight:700;letter-spacing:.04em}
+.card .ttl .role{color:var(--muted);text-transform:uppercase;font-size:10.5px;letter-spacing:.12em}
+.card.working{border-top-color:var(--c);box-shadow:0 0 0 1px color-mix(in srgb,var(--c) 30%,transparent),0 10px 30px -18px var(--c)}
+.card.error{border-top-color:var(--bad)}
 .card .head{display:flex;gap:12px;align-items:center}
-.card .st{display:flex;flex-direction:column;min-width:0;font-size:12px}
-.badge{display:none}
+.card .st{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:12px}
+.badge{align-self:flex-start;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;padding:0 7px;border-radius:999px;background:var(--panel2);color:var(--muted);border:1px solid var(--edge)}
+.working .badge{color:var(--c);border-color:color-mix(in srgb,var(--c) 50%,transparent);background:color-mix(in srgb,var(--c) 12%,transparent)}
+.done .badge{color:var(--good);border-color:color-mix(in srgb,var(--good) 35%,transparent)}
+.error .badge{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
 .stage{color:var(--soft)}
-.working .stage::before{content:"● ";color:var(--c);font-size:9px;vertical-align:1px;animation:pulse 1.2s infinite}
-.done .stage::before{content:"✓ ";color:var(--muted)}
-.error .stage::before{content:"✗ ";color:var(--bad)}
 .activity{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:1.6em}
-.track{display:none}
+.track{height:2px;border-radius:2px;background:var(--edge)}
+.working .track{background:linear-gradient(90deg,transparent,var(--c),transparent) var(--edge);background-size:35% 100%;background-repeat:no-repeat;animation:comet 1.5s linear infinite}
+.done .track{background:color-mix(in srgb,var(--c) 55%,var(--edge))}
+.error .track{background:var(--bad)}
+@keyframes comet{from{background-position:-35% 0}to{background-position:135% 0}}
 .body{color:var(--soft);font-size:12.5px;max-height:220px;overflow:hidden;mask-image:linear-gradient(transparent,#000 20px);display:flex;flex-direction:column-reverse}
 .body .inner{padding-top:4px}
 .error .body{color:var(--bad)}
-.foot{margin-top:auto;color:var(--muted);font-size:11px;white-space:nowrap;display:flex;gap:6px;overflow:hidden}
-.foot .model{overflow:hidden;text-overflow:ellipsis}
+.foot{margin-top:auto;color:var(--muted);font-size:11px;white-space:nowrap;display:flex;gap:6px;overflow:hidden;padding-top:6px;border-top:1px solid var(--edge)}
+.foot .model{overflow:hidden;text-overflow:ellipsis;color:color-mix(in srgb,var(--c) 60%,var(--muted))}
 .foot span:empty{display:none}
 .foot .tok::before,.foot .time::before{content:"· "}
-.cursor{display:inline-block;width:.55em;height:1.05em;background:var(--c);vertical-align:-2px;margin-left:2px;animation:caret 1s steps(2) infinite;opacity:.7}
+.cursor{display:inline-block;width:.55em;height:1.05em;background:var(--c);vertical-align:-2px;margin-left:2px;animation:caret 1s steps(2) infinite}
 @keyframes caret{50%{opacity:0}}
 .cards.solo{grid-template-columns:1fr}
 .cards.solo .card{min-height:0}
 .cards.solo .card .body{display:none}
 
-.verdict{margin-top:22px;display:none;border-top:1px solid var(--edge);padding-top:16px}
+.verdict{margin-top:18px;display:none;border:1px solid var(--edge2);border-left:3px solid var(--c);border-radius:8px;background:var(--ink);padding:16px 20px}
 .verdict.show{display:block}
-.verdict .ttl{color:var(--muted);font-size:11px;letter-spacing:.08em;margin-bottom:10px;display:flex;gap:8px}
+.verdict .ttl{display:flex;gap:10px;align-items:baseline;margin-bottom:10px;font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--text);font-weight:700}
 .verdict .ttl .name{color:var(--c)}
 .verdict .sub{float:right;color:var(--muted);font-size:11px}
-.verdict .drafting{color:var(--muted)}
+.verdict .drafting{color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
 .verdict .text{color:var(--text);line-height:1.7}
-.meter{display:flex;gap:24px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px;align-items:center}
+.meter{display:flex;gap:24px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--edge);color:var(--muted);font-size:11px;letter-spacing:.1em;text-transform:uppercase;align-items:center}
+.meter b{text-transform:none;letter-spacing:0}
 .meter .gauge{display:inline-flex;gap:2px;margin:0 8px;vertical-align:middle}
-.meter .gauge i{width:10px;height:3px;background:var(--edge2)}
-.actions{display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;align-items:center;font-size:12px}
-.btn{border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
-.btn:hover{color:var(--text)}
-.btn.primary{color:var(--soft)}
-.btn.primary::before{content:"→ ";color:var(--accent)}
-.applybox{display:inline-flex;gap:6px;align-items:baseline}
-.applybox select{color:var(--soft);border-bottom:1px dashed var(--edge2)}
-.handoff,.problem,.plan,.continue:not(:empty){margin-top:18px;font-size:12.5px}
-.handoff .ttl,.problem .ttl,.plan .ttl,.continue .ttl{display:block;color:var(--muted);font-size:11px;letter-spacing:.08em;margin-bottom:6px}
-.problem{border-left:1px solid var(--bad);padding-left:12px}
+.meter .gauge i{width:10px;height:4px;border-radius:1px;background:var(--edge2)}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center;font-size:12px}
+.btn{border:1px solid var(--edge2);border-radius:var(--r);background:var(--panel2);padding:4px 12px;cursor:pointer;color:var(--soft)}
+.btn:hover{color:var(--text);border-color:var(--muted)}
+.btn.primary{border-color:color-mix(in srgb,var(--accent) 60%,var(--edge2));color:var(--text);background:color-mix(in srgb,var(--accent) 12%,var(--panel2))}
+.applybox{display:inline-flex}
+.applybox .btn{border-radius:var(--r) 0 0 var(--r)}
+.applybox select{border-radius:0 var(--r) var(--r) 0;border-left:0;padding:4px 8px}
+.handoff,.problem,.plan,.continue:not(:empty){margin-top:14px;font-size:12.5px;border:1px solid var(--edge);border-radius:8px;padding:10px 14px;background:var(--ink)}
+.handoff .ttl,.problem .ttl,.plan .ttl,.continue .ttl{display:block;color:var(--muted);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px}
+.problem{border-color:color-mix(in srgb,var(--bad) 40%,var(--edge))}
 .problem .ttl{color:var(--bad)}
-.continue .sub{display:none}
 .fix{color:var(--text);margin-top:6px}
 code,pre{font-family:var(--mono);font-size:12.5px}
-:not(pre)>code{color:var(--text)}
-pre{background:var(--panel);border:1px solid var(--edge);padding:10px 12px;overflow:auto;white-space:pre-wrap}
-.text h3,.text h4,.text h5,.text h6,.body h3,.body h4,.body h5,.body h6{margin:12px 0 4px;font-size:13px;font-weight:500;color:var(--text)}
+:not(pre)>code{color:var(--accent2)}
+pre{background:var(--panel);border:1px solid var(--edge);border-radius:var(--r);padding:10px 12px;overflow:auto;white-space:pre-wrap}
+.text h3,.text h4,.text h5,.text h6,.body h3,.body h4,.body h5,.body h6{margin:12px 0 4px;font-size:13px;color:var(--text)}
 .text p{margin:8px 0}
-.text strong{color:var(--text);font-weight:500}
+.text strong{color:var(--text)}
 table{border-collapse:collapse;margin:8px 0}
-td,th{border:1px solid var(--edge);padding:3px 8px;text-align:left;font-weight:400}
-blockquote{margin:8px 0;padding-left:12px;border-left:1px solid var(--edge2);color:var(--soft)}
-details.opinion{margin-top:8px}
-details.opinion summary{cursor:pointer;color:var(--muted);font-size:12px}
-details.opinion summary:hover{color:var(--c)}
-details.opinion .text{padding:6px 0 6px 14px;border-left:1px solid color-mix(in srgb,var(--c) 40%,var(--edge))}
+td,th{border:1px solid var(--edge2);padding:3px 8px;text-align:left}
+blockquote{margin:8px 0;padding-left:12px;border-left:2px solid var(--edge2);color:var(--soft)}
+details.opinion{margin-top:8px;border:1px solid var(--edge);border-left:2px solid color-mix(in srgb,var(--c) 60%,var(--edge));border-radius:var(--r);background:var(--ink)}
+details.opinion summary{cursor:pointer;color:var(--c);font-size:12px;padding:6px 12px}
+details.opinion .text{padding:0 14px 10px}
 .continue .row{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 16px}
 .continue b{color:var(--c);cursor:pointer;font-weight:400}
 .continue code{color:var(--muted);cursor:pointer;overflow-wrap:anywhere}
@@ -824,26 +856,27 @@ details.opinion .text{padding:6px 0 6px 14px;border-left:1px solid color-mix(in 
 .plan .row.done .st{color:var(--good)}
 .plan .row.error .st{color:var(--bad)}
 @keyframes spin{to{transform:rotate(360deg)}}
-.sprite{width:34px;height:29px;flex:none;image-rendering:pixelated;opacity:.9}
+.sprite{width:44px;height:38px;flex:none;image-rendering:pixelated;filter:drop-shadow(0 0 6px color-mix(in srgb,var(--c) 35%,transparent))}
 .sprite svg{width:100%;height:100%;display:block;shape-rendering:crispEdges}
 .sprite .blink{opacity:0}
 .working .sprite{animation:bob .64s steps(2,jump-none) infinite}
 .working .sprite .blink{animation:wink 3.4s steps(1) infinite}
 @keyframes bob{50%{transform:translateY(-3px)}}
 @keyframes wink{0%,94%{opacity:0}95%,100%{opacity:1}}
-.card.waiting .sprite{opacity:.35;filter:grayscale(.6)}
-.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--edge2);color:var(--text);padding:8px 14px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw;font-size:12px}
+.card.waiting .sprite{opacity:.4;filter:grayscale(.6)}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--edge2);border-radius:var(--r);color:var(--text);padding:8px 14px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw;font-size:12px}
 .toast.show{opacity:1}
 main,.wrap,.run,.card{min-width:0}
 .body,.verdict .text,.handoff,.problem,.opinion .text{overflow-wrap:anywhere}
+@media (prefers-reduced-motion:reduce){.leaf,.ftabs,.crowd .sprite{animation:none}}
 @media (max-width:1050px){.cards{grid-template-columns:1fr!important}.app{grid-template-columns:1fr}aside{display:none}.app.sidebar aside{display:flex;max-height:55vh;border-right:0;border-bottom:1px solid var(--edge)}}
-@media (max-width:720px){.pills{display:none}header{gap:12px;padding:10px 14px}main{padding:14px}.go{margin-left:0}}
+@media (max-width:720px){.pills{display:none}header{gap:12px;padding:10px 14px}main{padding:14px}.go{margin-left:0}.hello{flex-direction:column;align-items:flex-start}}
 </style>
 </head>
 <body>
 <div class="app" id="app">
 <header>
-  <div class="logo">conclave<i>.</i></div>
+  <div class="logo">conclave</div>
   <span class="dim" id="minds"></span>
   <div class="spacer"></div>
   <div class="pills" id="pills"></div>
@@ -857,16 +890,13 @@ main,.wrap,.run,.card{min-width:0}
     <input class="field" id="folder" placeholder="paste a folder path ↵">
     <div class="list" id="projects" style="margin-top:8px"></div>
   </section>
-  <section>
-    <div class="label">claude code conversations</div>
-    <div class="list" id="convos"><div class="empty">Pick a project to see its conversations.</div></div>
-  </section>
 </aside>
 <main>
   <div class="wrap">
     <div class="hello" id="hello">
-      <h1>conclave<i>.</i></h1>
-      <p id="hellominds">Claude leads, the advisers argue it out, and you get one answer. Or send a task to one agent.</p>
+      <div class="crowd" id="crowd"></div>
+      <div><h1>Many minds, one answer<i>.</i></h1>
+      <p id="hellominds">Claude leads, the advisers argue it out, and you get one answer. Or send a task to one agent.</p></div>
     </div>
     <div class="composer">
       <div class="chips" id="context"></div>
@@ -980,20 +1010,21 @@ function applyTheme(name) {
   r.setProperty("--text", t.fg);
   ["g1", "g2", "g3"].forEach((k, i) => r.setProperty("--" + k, t.gradient[i]));
   Object.entries(t.colors).forEach(([k, v]) => r.setProperty("--" + k, v));
-  store.set("theme", name);
 }
 
 async function boot() {
   state.info = await api("/api/info");
   const themes = $("#theme");
   themes.innerHTML = Object.keys(state.info.themes).map(n => `<option>${n}</option>`).join("");
-  const savedTheme = store.get("theme", state.info.theme);
+  // Only a theme picked here is remembered, so a new default reaches everyone who never chose one.
+  const savedTheme = store.get("themeChoice", state.info.theme);
   themes.value = state.info.themes[savedTheme] ? savedTheme : state.info.theme; applyTheme(themes.value);
-  themes.onchange = () => applyTheme(themes.value);
+  themes.onchange = () => { applyTheme(themes.value); store.set("themeChoice", themes.value); };
   state.info.agents.forEach(a => state.agents[a.id] = a);
   state.advisers = store.get("advisers", state.info.advisers).filter(a => state.agents[a] && a !== "claude");
   if (!state.advisers.length) state.advisers = state.info.advisers;
   state.target = state.agents[store.get("target", null)] ? store.get("target", null) : null;
+  state.convoTool = store.get("convoTool", "all");
   state.access = store.get("access", "read"); if (state.access === "full") state.access = "read";  // full is asked for each visit
   $("#split").value = store.get("split", state.info.split);
   $("#split").onchange = () => store.set("split", $("#split").value);
@@ -1044,7 +1075,7 @@ function renderCouncil() {
   const absent = a => a.installed ? "" : ` (not installed: ${a.installCommand || a.install})`;
   $("#sendto").innerHTML = `<span class="k">send to</span><span class="dest council ${state.target ? "" : "on"}" data-dest="">council</span>`
     + state.info.agents.map(a => `<span class="dest ${state.target === a.id ? "on" : ""} ${a.installed ? "" : "absent"}" data-dest="${a.id}" style="${vars(a.id)}"
-      title="${esc(a.name + absent(a))}">${esc(handle(a.id))}</span>`).join("");
+      title="${esc(a.name + absent(a))}">${sprite(a.id, "done")}${esc(handle(a.id))}</span>`).join("");
   $("#sendto").querySelectorAll("[data-dest]").forEach(el => el.onclick = () => {
     state.target = el.dataset.dest || null; store.set("target", state.target);
     if (state.target && !AG(state.target).installed) toast(`${AG(state.target).name} isn't installed. In a terminal, run: ${AG(state.target).installCommand || AG(state.target).install}`);
@@ -1054,7 +1085,7 @@ function renderCouncil() {
   $("#lineup").innerHTML = `<span class="k">council</span>` + state.info.agents.map(a => {
     const seated = a.id === "claude" || state.advisers.includes(a.id);
     return `<span class="seat ${seated ? "on" : ""} ${a.installed ? "" : "absent"} ${a.id === "claude" ? "lead" : ""}" data-seat="${a.id}" style="${vars(a.id)}"
-      title="${esc((a.id === "claude" ? "leads · " : seated ? "click to unseat · " : "click to seat · ") + a.strengths + absent(a))}">${esc(handle(a.id))}</span>`; }).join("");
+      title="${esc((a.id === "claude" ? "leads · " : seated ? "click to unseat · " : "click to seat · ") + a.strengths + absent(a))}">${sprite(a.id, "done")}${esc(handle(a.id))}</span>`; }).join("");
   $("#lineup").querySelectorAll("[data-seat]").forEach(el => el.onclick = () => {
     const id = el.dataset.seat; if (id === "claude") return;
     if (state.advisers.includes(id)) { if (state.advisers.length === 1) return toast("The council needs at least one adviser");
@@ -1076,36 +1107,57 @@ function renderCouncil() {
   $("#question").placeholder = state.target ? `What should ${AG(state.target).name} do?` : "What should the council look at?";
   $("#ptags").innerHTML = (state.target ? `<span class="tag to" style="${vars(state.target)}">${esc(handle(state.target))}</span> ` : "")
     + (state.target && state.access !== "read" ? `<span class="tag acc ${state.access}">${state.access}</span> ` : "");
+  const crowd = $("#crowd"); if (crowd) crowd.innerHTML = (state.target ? [state.target] : members).map(id => sprite(id, "done")).join("");
   $("#minds").textContent = state.target ? `→ ${handle(state.target)}` : `${members.length} minds · one answer`;
 }
 
+const TOOL_NAMES = {claude: "Claude Code", gemini: "Gemini CLI", openai: "Codex"};
+
 async function loadProjects() {
   state.projects = await api("/api/projects");
-  $("#projects").innerHTML = state.projects.length ? state.projects.map((p, i) =>
-    `<div class="item ${p.path === state.project ? "on" : ""}" data-path="${esc(p.path)}"><span class="n">${i + 1}</span><div class="t">${esc(p.name)}</div>
-     <div class="s"><span>${p.count} conversation${p.count === 1 ? "" : "s"}</span><span>${esc(p.when)}</span></div></div>`).join("")
-    : `<div class="empty">No Claude Code projects found in ~/.claude/projects yet. Paste a folder path above.</div>`;
-  document.querySelectorAll("#projects .item").forEach(el => el.onclick = () => selectProject(el.dataset.path));
+  renderProjects();
 }
 
 async function selectProject(path) {
+  if (path === state.project) { state.treeOpen = !state.treeOpen; renderProjects(); return; }
   try {
     const data = await api("/api/conversations?project=" + encodeURIComponent(path));
     if (data.project !== state.project) state.threads = {};  // agents' conversations belong to the project they were in
     state.project = data.project; state.convos = data.conversations; state.conversation = null; store.set("project", state.project);
   } catch (e) { toast(e.message); return; }
-  document.querySelectorAll("#projects .item").forEach(el => el.classList.toggle("on", el.dataset.path === state.project));
-  renderConvos(); renderContext();
+  if (!state.projects.some(p => p.path === state.project))
+    state.projects.unshift({path: state.project, name: state.project.split("/").pop() || state.project, when: "", count: state.convos.length});
+  state.treeOpen = true;
+  renderProjects(); renderContext();
 }
 
-function renderConvos() {
-  const box = $("#convos");
-  box.innerHTML = state.convos.length ? state.convos.map((c, i) =>
-    `<div class="item ${state.conversation === c.id ? "on" : ""}" data-id="${c.id}"><span class="n">${i + 1}</span><div class="t">${esc(c.title)}</div>
-     <div class="s"><span>${esc(c.when)}</span><span>${c.messages} msgs</span>${c.errors ? `<span class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</span>` : ""}${c.branch ? `<span>⎇ ${esc(c.branch)}</span>` : ""}</div></div>`).join("")
-    : `<div class="empty">No Claude Code conversations for this folder. You can still ask about the project.</div>`;
-  box.querySelectorAll(".item").forEach(el => el.onclick = () => {
-    state.conversation = state.conversation === el.dataset.id ? null : el.dataset.id; renderConvos(); renderContext(); $("#question").focus(); });
+// Projects as a tree: the open one unfolds into its conversations from each tool, filtered by tool, one row at a time.
+function renderProjects() {
+  $("#projects").innerHTML = state.projects.length ? state.projects.map(p => {
+    const open = p.path === state.project && state.treeOpen;
+    return `<div class="proj ${open ? "open" : ""}" data-path="${esc(p.path)}"><div class="item" title="${esc(p.path)}"><span class="tw">${open ? "▾" : "▸"}</span>`
+      + `<span class="t">${esc(p.name)}</span><span class="s">${esc(p.when)}</span></div>${open ? treeHTML() : ""}</div>`; }).join("")
+    : `<div class="empty">No conversations found yet in Claude Code, Gemini CLI or Codex. Paste a folder path above.</div>`;
+  $("#projects").querySelectorAll(".proj > .item").forEach(el => el.onclick = () => selectProject(el.parentElement.dataset.path));
+  $("#projects").querySelectorAll("[data-tool-filter]").forEach(el => el.onclick = () => {
+    state.convoTool = el.dataset.toolFilter; store.set("convoTool", state.convoTool); renderProjects(); });
+  $("#projects").querySelectorAll(".leaf").forEach(el => el.onclick = () => {
+    state.conversation = state.conversation === el.dataset.id ? null : el.dataset.id; renderProjects(); renderContext(); $("#question").focus(); });
+}
+const renderConvos = renderProjects;
+
+function treeHTML() {
+  const counts = {all: state.convos.length};
+  state.convos.forEach(c => counts[c.tool] = (counts[c.tool] || 0) + 1);
+  const filter = counts[state.convoTool] ? state.convoTool : "all";
+  const tabs = ["all", "claude", "gemini", "openai"].filter(t => t === "all" || counts[t]).map(t =>
+    `<span class="ftab ${t === filter ? "on" : ""}" data-tool-filter="${t}" style="${t === "all" ? "" : `--c:var(--${t})`}">${t === "all" ? "all" : esc(handle(t))}<b>${counts[t]}</b></span>`).join("");
+  const shown = state.convos.filter(c => filter === "all" || c.tool === filter);
+  if (!shown.length) return `<div class="tree"><div class="empty" style="padding-left:16px">No conversations in this folder yet. You can still ask about the project.</div></div>`;
+  return `<div class="tree">${Object.keys(counts).length > 2 ? `<div class="ftabs">${tabs}</div>` : ""}` + shown.map((c, i) =>
+    `<div class="leaf ${state.conversation === c.id ? "on" : ""}" data-id="${esc(c.id)}" style="--i:${i};--c:var(--${c.tool})" title="${esc(`${c.toolName} · ${c.messages} messages · ${c.title}`)}">`
+    + `<div class="t"><i></i>${esc(c.title)}</div><div class="s"><span>${esc(handle(c.tool))}</span><span>${esc(c.when)}</span>`
+    + `${c.errors ? `<span class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</span>` : ""}${c.branch ? `<span>⎇ ${esc(c.branch)}</span>` : ""}</div></div>`).join("") + "</div>";
 }
 
 function renderContext() {
@@ -1113,13 +1165,13 @@ function renderContext() {
   if (state.project) chips.push(`<span class="chip live">⌂ <span>${esc(state.project)}</span><button data-x="project" title="Stop reviewing this project">✕</button></span>`);
   else chips.push(`<span class="chip">No project: the models run in ${esc(state.info.cwd)}</span>`);
   const c = state.convos.find(c => c.id === state.conversation);
-  if (c) chips.push(`<span class="chip live">❝ <span>${esc(c.title)}</span>${c.errors ? `<b class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</b>` : ""}<button data-x="conversation" title="Detach">✕</button></span>`);
-  else if (state.project && state.convos.length) chips.push(`<span class="chip">Attach a Claude Code conversation from the sidebar for context</span>`);
+  if (c) chips.push(`<span class="chip live" style="--c:var(--${c.tool})">❝ <b style="color:var(--c);font-weight:400">${esc(handle(c.tool))}</b> <span>${esc(c.title)}</span>${c.errors ? `<b class="err">${c.errors} error${c.errors === 1 ? "" : "s"}</b>` : ""}<button data-x="conversation" title="Detach">✕</button></span>`);
+  else if (state.project && state.convos.length) chips.push(`<span class="chip">Attach a conversation from the sidebar for context</span>`);
   if (state.target && state.threads[state.target]) chips.push(`<span class="chip live" style="${vars(state.target)}">↺ <span>carrying on ${esc(AG(state.target).name)}'s conversation</span><button data-x="thread" title="Start a new conversation with it">✕</button></span>`);
   else if (state.history.length) chips.push(`<span class="chip">↺ follow-up remembers ${Math.min(state.history.length, 3)} answer${state.history.length > 1 ? "s" : ""}<button data-x="history" title="Start fresh">✕</button></span>`);
   $("#context").innerHTML = chips.join("");
   $("#context").querySelectorAll("[data-x]").forEach(b => b.onclick = () => {
-    if (b.dataset.x === "project") { state.project = null; state.conversation = null; state.convos = []; state.threads = {}; store.set("project", null); renderConvos(); loadProjects(); }
+    if (b.dataset.x === "project") { state.project = null; state.conversation = null; state.convos = []; state.threads = {}; store.set("project", null); loadProjects(); }
     if (b.dataset.x === "conversation") { state.conversation = null; renderConvos(); }
     if (b.dataset.x === "history") state.history = [];
     if (b.dataset.x === "thread") delete state.threads[state.target];
@@ -1216,6 +1268,8 @@ function follow(id, el, question, phaseDefs, agent) {
   events.onerror = () => { if (run.done) events.close(); };
   el.querySelector('[data-act="cancel"]').onclick = () => api(`/api/runs/${id}/cancel`, {}).catch(e => toast(e.message));
   el.dataset.run = id;
+  const conv = state.convos.find(c => c.id === state.conversation);
+  el.dataset.tool = conv ? conv.tool : "claude";
 }
 
 function finish(el, e, question) {
@@ -1239,7 +1293,7 @@ function finish(el, e, question) {
   v.querySelector(".meterbox").innerHTML = (meter ? `<div class="meter">${meter}</div>` : "") + "";
   const applyChoices = state.info.agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join("");
   actions.innerHTML = (solo ? "" : `<span class="applybox"><button class="btn primary" data-act="apply" title="Have an agent make these changes in the project, at edit access (or full, if you chose it)">apply with</button><select class="field" data-act="applyto">${applyChoices}</select></span>`)
-    + `<button class="btn ${solo ? "primary" : ""}" data-act="handoff">hand back to Claude Code</button><button class="btn" data-act="copy">copy</button>
+    + `<button class="btn ${solo ? "primary" : ""}" data-act="handoff">hand back to ${TOOL_NAMES[el.dataset.tool] || "Claude Code"}</button><button class="btn" data-act="copy">copy</button>
     <button class="btn" data-act="follow">${solo ? `carry on with ${esc(AG(r.speaker).name)}` : "ask a follow-up"}</button>`;
   actions.querySelector('[data-act="copy"]').onclick = () => navigator.clipboard.writeText(r.final).then(() => toast("Copied"));
   actions.querySelector('[data-act="follow"]').onclick = () => {
@@ -1253,7 +1307,7 @@ function finish(el, e, question) {
   actions.querySelector('[data-act="handoff"]').onclick = async () => {
     try { const h = await api(`/api/runs/${el.dataset.run}/handoff`, {});
       let box = el.querySelector(".handoff"); if (!box) { box = document.createElement("div"); box.className = "handoff"; actions.after(box); }
-      box.innerHTML = `<span class="ttl">hand back to claude code</span>Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue the Claude Code conversation with it:<pre>${esc(h.command)}</pre>`;
+      box.innerHTML = `<span class="ttl">hand back to ${(TOOL_NAMES[el.dataset.tool] || "Claude Code").toLowerCase()}</span>Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue that conversation with it:<pre>${esc(h.command)}</pre>`;
       navigator.clipboard.writeText(h.command).then(() => toast("Command copied — paste it in Terminal"), () => {});
     } catch (err) { toast(err.message); } };
   const saved = Object.keys(r.sessions || {});

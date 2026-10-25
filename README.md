@@ -1,6 +1,6 @@
 # Conclave
 
-When a Claude Code project gets stuck on an error that a fresh pair of eyes would spot, bring it to the council. Conclave reads the Claude Code conversation you were having (including the errors Claude hit), looks at the project's git state, and asks Gemini and ChatGPT for independent opinions while they read the code themselves. Claude, as lead, weighs everything and writes one verdict. Then have an agent apply it to the project, or hand it straight back to the same Claude Code conversation.
+When a project gets stuck on an error that a fresh pair of eyes would spot, bring it to the council. Conclave reads the conversation you were having, in Claude Code, Gemini CLI or Codex (including the errors it hit), looks at the project's git state, and asks Gemini and ChatGPT for independent opinions while they read the code themselves. Claude, as lead, weighs everything and writes one verdict. Then have an agent apply it to the project, or hand it straight back to the same conversation.
 
 You can also skip the council and work with one agent, the way you would in Claude Code: `@claude fix the login test` (or `@gemini`, `@chatgpt`…) hands the task to that agent, lets it edit the project if you allow it, and keeps one conversation going with it.
 
@@ -53,7 +53,7 @@ To update, run `conclave update`. It reinstalls the latest version from where yo
 conclave --app
 ```
 
-This opens Conclave in your browser: a quiet, monospace page where each agent's box carries a thin line of its maker's colour. The sidebar lists every project you have used Claude Code in, and each project's conversations show how many errors they hit. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, as in the terminal: Claude in clay with rounded corners, Gemini blue with a double frame, ChatGPT green and square. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
+This opens Conclave in your browser: a monospace page in the same purple as the terminal, where each agent works in a card edged in its maker's colour. The sidebar lists every project you've worked on with Claude Code, Gemini CLI or Codex. Click one and it unfolds into its conversations from all three, each marked with its tool and how many errors it hit; the **claude · gemini · chatgpt** tabs above them switch between tools. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, outlined in its maker's colour: Claude clay, Gemini blue, ChatGPT green. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
 
 **Models** has a field for each agent in play: type any model, or pick one from its list. The list holds Claude's `opus`, `sonnet` and `haiku`, the models Antigravity and Ollama say they have, and any model an agent has reported or is set to in its own settings. Leave a field empty for that tool's default. **Send to** picks who gets the question: the whole council, or one agent. With one agent you also choose its access (**Read**, **Edit** or **Full**, explained below), and follow-ups carry on that agent's conversation.
 
@@ -96,13 +96,13 @@ Each person picks their own access level: you might give hand-offs full access o
 
 ### Why it isn't hosted on Vercel
 
-Conclave runs on your computer on purpose. It uses the `claude`, `gemini` and `codex` tools you're already signed in to, so it costs nothing beyond your subscriptions. It also reads your Claude Code conversations and project files from your disk. A hosted site can do neither: it would need separately billed API keys, and you'd have to upload conversations and code to it.
+Conclave runs on your computer on purpose. It uses the `claude`, `gemini` and `codex` tools you're already signed in to, so it costs nothing beyond your subscriptions. It also reads your conversations and project files from your disk. A hosted site can do neither: it would need separately billed API keys, and you'd have to upload conversations and code to it.
 
 The app only listens on 127.0.0.1, and it only answers requests that carry a secret token from the page it served. That stops other websites from starting rounds. The page loads its typeface (JetBrains Mono) from Google Fonts; offline it falls back to your system's monospace font.
 
 ## In the terminal
 
-Run `conclave` on its own for an interactive session. Inside a project folder it tells you how many Claude Code conversations it found.
+Run `conclave` on its own for an interactive session. While it runs, Conclave asks your terminal to paint its whole background in the theme's colour, and puts your own back when you leave. iTerm2, Ghostty, kitty, WezTerm and most modern terminals do this; ones that don't simply ignore it, and in macOS Terminal you can set the profile's background to `#05060B` instead. `[ui] background = false` turns it off. Inside a project folder it tells you how many conversations it found there, from Claude Code, Gemini CLI and Codex.
 
 ```sh
 cd ~/code/shop-api
@@ -110,7 +110,7 @@ conclave
 ```
 
 ```text
-/convos              list this project's Claude Code conversations
+/convos              list this project's conversations (/convos gemini shows only Gemini CLI's)
 /attach latest       bring the newest one to the council (or /attach 2, or a session id)
 Why does test_login keep failing after the session refactor?
 /apply               have Claude make the verdict's changes in the project
@@ -123,7 +123,7 @@ Why does test_login keep failing after the session refactor?
 | `/to <agent\|council>` | Send every message to one agent (`@claude` on its own does the same) or back to the council |
 | `/access <read\|edit\|full>` | What hand-offs may do (see below). Full asks you to confirm |
 | `/apply [agent]` | Have an agent (Claude by default) carry out the last verdict in the project, at edit access or more |
-| `/convos` | List the project's Claude Code conversations, with message and error counts |
+| `/convos [claude\|gemini\|chatgpt\|all]` | List the project's conversations from Claude Code, Gemini CLI and Codex, with message and error counts, or only one tool's |
 | `/attach <n\|latest\|id>` | Send a conversation along with each question |
 | `/detach` | Stop sending it |
 | `/project [path\|none]` | Show or set the folder the models read and review |
@@ -240,7 +240,8 @@ gemini = "GEMINI_MODEL_ID"
 chatgpt = "OPENAI_MODEL_ID" # "codex" and "openai" work too
 
 [ui]
-theme = "sys"               # sys (default, signal red), branchhq, ring0, mend, spherex or kakeya
+theme = "branchhq"          # branchhq (default, purple), sys (signal red), ring0, mend, spherex or kakeya
+background = true           # paint the terminal's background in the theme's colour during a session
 
 [sessions]
 save = true                 # false: don't keep rounds in Claude Code, Gemini CLI and Codex

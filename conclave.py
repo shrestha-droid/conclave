@@ -133,7 +133,7 @@ THEMES = {
     },
 }
 THEME_ALIASES = {"violet": "branchhq", "ember": "kakeya", "aurora": "spherex", "matrix": "mend", "mono": "sys"}
-DEFAULT_THEME = "sys"
+DEFAULT_THEME = "branchhq"  # Branch HQ's night-sky purple
 GOOD, WARN, BAD = "#4ADE80", "#FFB547", "#FF9F43"
 
 
@@ -171,6 +171,7 @@ class Settings:
     advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS
     split: str = "auto"  # "auto": Claude splits big tasks into subtasks; "always" or "never"
     gemini: str = "auto"  # the tool behind the Gemini seat: "antigravity", "gemini-cli", or "auto"
+    background: bool = True  # paint the terminal's background in the theme's colour during a session
 
 
 def load_config(path: Path) -> Settings:
@@ -214,6 +215,8 @@ def load_config(path: Path) -> Settings:
     theme = ui.get("theme")
     if theme is not None and THEME_ALIASES.get(theme, theme) not in THEMES:
         raise ValueError(f"Unknown theme {theme!r} in [ui] in {path}; choose from {', '.join(THEMES)}")
+    if not isinstance(ui.get("background", True), bool):
+        raise ValueError(f"[ui] background in {path} must be true or false")
     sessions = data.get("sessions", {})
     if not isinstance(sessions, dict) or not isinstance(sessions.get("save", True), bool):
         raise ValueError(f"[sessions] in {path} must be a table with save = true or false")
@@ -228,7 +231,7 @@ def load_config(path: Path) -> Settings:
     if split not in ("auto", "always", "never"):
         raise ValueError(f"[council] split in {path} must be \"auto\", \"always\" or \"never\"")
     return Settings(selected, theme, sessions.get("save", True), council.get("cross_examine", True), advisers, split,
-                    tool)
+                    tool, ui.get("background", True))
 
 
 def load_models(path: Path) -> dict[str, str]:
@@ -1393,7 +1396,7 @@ def remember(history: list[tuple[str, str]]) -> str:
 
 
 def compose(request: str, project: Path | None = None, conversation=None, history=()) -> str:
-    """The task the council sees: project state, the Claude Code conversation and earlier answers, then the request."""
+    """The task the council sees: project state, the attached conversation and earlier answers, then the request."""
     parts = []
     if project or conversation:
         parts.append(conclave_context.context_block(project, conversation))
@@ -1885,6 +1888,7 @@ def hand_back(project: Path, conversation, verdict: str) -> None:
     except OSError as exc:
         console.print(f"  [{BAD}]Could not save the verdict in {project}:[/] {exc}")
         return
+    tool = conversation.tool_name if conversation else "Claude Code"
     copied = False
     if shutil.which("pbcopy"):
         try:
@@ -1896,10 +1900,10 @@ def hand_back(project: Path, conversation, verdict: str) -> None:
         Group(
             Text.assemble(("Saved ", MUTED), (str(path), FG)),
             Text(""),
-            Text("Run this to give the verdict back to Claude Code" + (" (copied to your clipboard):" if copied else ":"), style=MUTED),
+            Text(f"Run this to give the verdict back to {tool}" + (" (copied to your clipboard):" if copied else ":"), style=MUTED),
             Text(command, style=f"bold {ACCENT}"),
         ),
-        title=label("Hand back to Claude Code"),
+        title=label(f"Hand back to {tool}"),
         title_align="left",
         box=BRACKETS,
         border_style=EDGE,
@@ -2066,8 +2070,8 @@ COMMANDS = (
     ("/agents [add|remove] [agent]", "list the agents (Qwen, Copilot, OpenCode, Ollama, your own...), or seat and unseat advisers"),
     ("/split [auto|always|never]", "whether Claude may split a big task into subtasks for the agents best suited"),
     ("/quick", "toggle the cross-examination round (on: advisers critique each other before the verdict)"),
-    ("/convos", "list the Claude Code conversations for this project"),
-    ("/attach <n|latest|id>", "bring a Claude Code conversation to the council"),
+    ("/convos [claude|gemini|chatgpt|all]", "list this project's conversations from Claude Code, Gemini CLI and Codex"),
+    ("/attach <n|latest|id>", "bring one of those conversations to the council"),
     ("/detach", "stop sending the attached conversation"),
     ("/project [path|none]", "show or set the project folder the models read and review"),
     ("/handoff", "save the last verdict and show the command that gives it back to Claude Code"),
@@ -2103,7 +2107,9 @@ class Session:
         self.last_report = ""
         self.prompt = None  # the prompt_toolkit session, so a theme change can restyle it
         self.project: Path | None = None  # the folder the models work in and review
-        self.conversation = None  # an attached Claude Code conversation (conclave_context.Conversation)
+        self.conversation = None  # an attached conversation from Claude Code, Gemini CLI or Codex
+        self.convo_tools = conclave_context.TOOLS  # whose conversations /convos lists and /attach numbers
+        self.background = False  # whether the terminal's background is painted in the theme's colour
         self.target: str | None = None  # where plain messages go: None for the council, or one agent's id
         self.access = "read"  # what hand-offs may do (the council itself always only reads)
         self.threads: dict[str, str] = {}  # agent -> its session id, so hand-offs to it carry on one conversation
@@ -2175,35 +2181,8 @@ class Session:
             padding=(1, 2),
         )
 
-    def boot(self) -> None:
-        """The SP_SYS boot: a few status lines in the signal colour, about a second, once per session."""
-        members = ("claude", *self.advisers)
-        online = [m for m in members if shutil.which(PROVIDERS[m])]
-        try:
-            import getpass
-            operator = getpass.getuser().upper()
-        except (ImportError, OSError, KeyError):
-            operator = "OPERATOR"
-        projects = len(conclave_context.projects())
-        ok = lambda text: (text, f"bold {GOOD}")  # noqa: E731
-        lines = [
-            [("CONCLAVE // COUNCIL OS ", ACCENT), ok("OK")],
-            [("MOUNTING CLAUDE CODE INDEX ... ", ACCENT), ok(f"{projects} PROJECTS")],
-            [("SEATING COUNCIL ... ", ACCENT), (" · ".join(SESSION_NAMES[m].upper() for m in members), SOFT)],
-            [("LINKING PROVIDERS ... ", ACCENT), ok("OK") if len(online) == len(members)
-             else (f"{len(online)}/{len(members)} ONLINE", f"bold {WARN}")],
-            [(f"OPERATOR {operator} ... ", ACCENT), ("AUTHENTICATED", SOFT)],
-            [("> WELCOME.", f"bold {FG}")],
-        ]
-        for parts in lines:
-            console.print(Text("  ") + Text.assemble(*parts))
-            time.sleep(0.17)
-        console.print()
-
     def welcome(self, animate: bool = False) -> None:
         console.print()
-        if animate:
-            self.boot()
         wide = console.size.width >= len(BANNER[0]) + 8
         lines = BANNER if wide else ("C O N C L A V E",)
         for row, line in enumerate(lines):
@@ -2222,7 +2201,8 @@ class Session:
         if here:
             console.print(Text.assemble(
                 ("  ❝ ", f"bold {ACCENT}"),
-                (f"This folder has {len(here)} Claude Code conversation{'s' if len(here) != 1 else ''}. ", SOFT),
+                (f"This folder has {plural(len(here), 'conversation')} "
+                 f"({', '.join(n for n in ('Claude Code', 'Gemini CLI', 'Codex') if any(c.tool_name == n for c in here))}). ", SOFT),
                 ("/convos", f"bold {ACCENT}"), (" lists them · ", MUTED),
                 ("/attach latest", f"bold {ACCENT}"), (" brings the newest to the council", MUTED),
             ))
@@ -2549,15 +2529,23 @@ class Session:
                 console.print(f"  [{BAD}]Unknown theme {rest[0]}.[/] Choose from {', '.join(THEMES)}.")
             else:
                 apply_theme(rest[0].lower())
+                if self.background:
+                    paint_background(INK)
                 if self.prompt is not None:
                     self.prompt.style = prompt_style()
                 console.print(Text("  ") + label("Theme", THEME))
         elif name == "/stats":
             self.stats()
         elif name == "/convos":
+            if rest:
+                tool = ALIASES.get(rest[0].lower(), rest[0].lower())
+                if tool not in (*conclave_context.TOOLS, "all"):
+                    console.print(f"  [{BAD}]Usage:[/] /convos [claude|gemini|chatgpt|all]")
+                    return True
+                self.convo_tools = conclave_context.TOOLS if tool == "all" else (tool,)
             self.list_conversations()
         elif name == "/attach":
-            found = conclave_context.find(self.project or Path.cwd(), rest[0] if rest else "latest")
+            found = conclave_context.find(self.project or Path.cwd(), rest[0] if rest else "latest", self.convo_tools)
             if not found:
                 console.print(f"  [{BAD}]No matching conversation.[/] /convos lists them; attach by number, latest or session id.")
             else:
@@ -2565,7 +2553,7 @@ class Session:
                 if found.project and Path(found.project).is_dir() and Path(found.project) != self.project:
                     self.project = Path(found.project)
                     self.threads.clear()  # an agent's session belongs to the folder it ran in
-                self.note(f"Attached “{excerpt(found.title, 70)}” ({found.messages} messages, {plural(found.errors, 'error')}, {found.when}). "
+                self.note(f"Attached {found.tool_name}'s “{excerpt(found.title, 60)}” ({found.messages} messages, {plural(found.errors, 'error')}, {found.when}). "
                           "Each question now includes it.")
         elif name == "/detach":
             self.conversation = None
@@ -2607,23 +2595,26 @@ class Session:
         return True
 
     def list_conversations(self) -> None:
-        listed = conclave_context.conversations(self.project or Path.cwd())
+        listed = conclave_context.conversations(self.project or Path.cwd(), tools=self.convo_tools)
+        whose = " or ".join(conclave_context.TOOL_NAMES[t] for t in self.convo_tools)
         if not listed:
-            self.note(f"No Claude Code conversations for {home(self.project or Path.cwd())}. /project <path> picks another folder.")
+            self.note(f"No {whose} conversations for {home(self.project or Path.cwd())}. /project <path> picks another folder.")
             return
         table = Table.grid(padding=(0, 2))
         for number, item in enumerate(listed, 1):
             attached = self.conversation and self.conversation.id == item.id
             table.add_row(
                 Text(f"{number:>2}", style=f"bold {ACCENT}" if attached else MUTED),
+                Text(conclave_context.SPEAKERS[item.tool].lower(), style=COLORS.get(item.tool, MUTED)),
                 Text(excerpt(item.title, 64), style=f"bold {ACCENT}" if attached else FG),
                 Text(item.when, style=MUTED),
                 Text(f"{item.messages} msgs", style=MUTED),
                 Text(plural(item.errors, "error"), style=BAD if item.errors else MUTED),
                 Text(item.id[:8], style=blend(MUTED, INK, 0.3)),
             )
-        console.print(Panel(table, title=label("Claude Code conversations"), title_align="left",
-                            subtitle=Text(f" {home(self.project or Path.cwd())} · /attach <n> ", style=MUTED),
+        console.print(Panel(table, title=label("Conversations", whose if len(self.convo_tools) == 1 else "claude · gemini · chatgpt"),
+                            title_align="left",
+                            subtitle=Text(f" {home(self.project or Path.cwd())} · /attach <n> · /convos gemini filters ", style=MUTED),
                             subtitle_align="right", box=BRACKETS, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
     def shell(self, command: str) -> None:
@@ -2639,7 +2630,7 @@ class Session:
             if not self.project:
                 self.threads.clear()  # hand-offs ran in the old folder, and their sessions belong to it
             found = conclave_context.conversations(Path.cwd(), limit=200)
-            self.note(f"Now in {home(Path.cwd())}" + (f": {plural(len(found), 'Claude Code conversation')} here, "
+            self.note(f"Now in {home(Path.cwd())}" + (f": {plural(len(found), 'conversation')} here, "
                                                        "/convos lists them" if found else ""))
             return
         code = run_visible(command, cwd=self.project)
@@ -2816,11 +2807,33 @@ def confirm_shell(line: str) -> bool:
         return False
 
 
+def paint_background(color: str | None) -> None:
+    """Set the terminal's own background to `color` (OSC 11), or put the person's back (OSC 111). Terminals that
+    don't support these ignore them."""
+    if not console.is_terminal:
+        return
+    console.file.write(f"\033]11;{color}\a" if color else "\033]111\a")
+    console.file.flush()
+
+
 def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bool,
                 project: Path | None = None, conversation=None, save_sessions: bool = True,
                 cross_examine: bool = True, advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS,
-                split: str = "auto", agent: str | None = None, access: str = "read") -> int:
+                split: str = "auto", agent: str | None = None, access: str = "read", background: bool = True) -> int:
+    if background:
+        paint_background(INK)
+    try:
+        return session_loop(selected, timeout, show_opinions, project, conversation, save_sessions, cross_examine,
+                            advisers, split, agent, access, background)
+    finally:
+        if background:
+            paint_background(None)
+
+
+def session_loop(selected, timeout, show_opinions, project, conversation, save_sessions, cross_examine, advisers,
+                 split, agent, access, background) -> int:
     session = Session(selected, timeout, show_opinions)
+    session.background = background
     session.target, session.access = agent, access
     session.save_sessions = save_sessions
     session.cross_examine = cross_examine
@@ -2899,8 +2912,10 @@ def main() -> int:
                         help="colour theme, each from one of your projects (default: sys)")
     parser.add_argument("-p", "--project", type=Path, help="project folder the models work in and review (its git state is included)")
     parser.add_argument("-c", "--conversation", metavar="N|latest|ID",
-                        help="bring a Claude Code conversation for the project: its number in --list-conversations, latest, or session id")
-    parser.add_argument("--list-conversations", action="store_true", help="list the project's Claude Code conversations and exit")
+                        help="bring a conversation (Claude Code, Gemini CLI or Codex) for the project: its number in "
+                        "--list-conversations, latest, or session id")
+    parser.add_argument("--list-conversations", action="store_true",
+                        help="list the project's Claude Code, Gemini CLI and Codex conversations and exit")
     parser.add_argument("--advisers", metavar="LIST", dest="advisers_flag",
                         help="comma-separated advisers to seat, e.g. gemini,codex,qwen (see /agents; default from the config)")
     parser.add_argument("--split", choices=("auto", "always", "never"),
@@ -2967,16 +2982,16 @@ def main() -> int:
     if args.list_conversations:
         listed = conclave_context.conversations(project or Path.cwd())
         if not listed:
-            print(f"No Claude Code conversations for {project or Path.cwd()}.", file=sys.stderr)
+            print(f"No conversations for {project or Path.cwd()}.", file=sys.stderr)
             return 1
         for number, item in enumerate(listed, 1):
-            print(f"{number:>3}  {item.id[:8]}  {item.when:>9}  {item.messages:>4} msgs  {plural(item.errors, 'error'):>9}  {item.title[:70]}")
+            print(f"{number:>3}  {conclave_context.SPEAKERS[item.tool].lower():<7}  {item.id[:8]}  {item.when:>9}  {item.messages:>4} msgs  {plural(item.errors, 'error'):>9}  {item.title[:70]}")
         return 0
     conversation = None
     if args.conversation:
         conversation = conclave_context.find(project or Path.cwd(), args.conversation)
         if not conversation:
-            parser.error(f"no Claude Code conversation {args.conversation!r} for {project or Path.cwd()}; see --list-conversations")
+            parser.error(f"no conversation {args.conversation!r} for {project or Path.cwd()}; see --list-conversations")
         if not project and conversation.project and Path(conversation.project).is_dir():
             project = Path(conversation.project)
     words = " ".join(args.task).strip()
@@ -3011,7 +3026,7 @@ def main() -> int:
                                                       ("openai", args.openai_model)) if value})
     if session:
         return interactive(selected, args.timeout, args.show_opinions, project, conversation, args.save_sessions,
-                           args.cross_examine, args.advisers, args.split, args.agent, args.access)
+                           args.cross_examine, args.advisers, args.split, args.agent, args.access, settings.background)
     return run(args, selected, project, conversation)
 
 

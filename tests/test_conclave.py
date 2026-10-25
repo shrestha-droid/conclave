@@ -726,9 +726,79 @@ def test_list_conversations_and_handoff(fake_bin, tmp_path):
     assert "claude --resume abc12345-0000" in re.sub(r"\s+", " ", result.stderr)
 
 
+def write_gemini_chat(home: Path, project: Path) -> Path:
+    """A Gemini CLI chat in the JSON-lines format: metadata, messages, a tool call that failed, a patch and a rewind."""
+    store = home / ".gemini" / "tmp" / "shop"
+    (store / "chats").mkdir(parents=True)
+    (store / ".project_root").write_text(str(project))
+    lines = [
+        {"sessionId": "gem-1111", "projectHash": "x", "startTime": "2026-10-25T10:00:00Z", "kind": "main"},
+        {"id": "m1", "type": "user", "content": [{"text": "Why does the build fail?"}]},
+        {"id": "m2", "type": "gemini", "content": "", "toolCalls": [
+            {"id": "t1", "name": "run_shell_command", "args": {"command": "npm run build"}, "status": "error",
+             "result": [{"functionResponse": {"response": {"output": "TS2304: Cannot find name 'token'"}}}]}]},
+        {"id": "m2", "content": "The build fails on an undefined token."},
+        {"id": "m3", "type": "user", "content": "never mind"},
+        {"$rewindTo": "m3"},
+        {"$set": {"summary": "Build fails on token"}},
+    ]
+    path = store / "chats" / "session-2026-10-25T10-00-gem1111.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    return path
+
+
+def write_codex_rollout(home: Path, project: Path) -> Path:
+    """A Codex rollout: session_meta, injected context, the typed request, a failing command and the answer."""
+    folder = home / ".codex" / "sessions" / "2026" / "10" / "25"
+    folder.mkdir(parents=True)
+    lines = [
+        {"type": "session_meta", "payload": {"id": "cdx-2222", "cwd": str(project), "git": {"branch": "main"}}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                               "content": [{"type": "input_text", "text": "<environment_context>…</environment_context>"}]}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Make the tests pass"}},
+        {"type": "response_item", "payload": {"type": "function_call", "name": "shell", "call_id": "c1",
+                                               "arguments": json.dumps({"command": ["pytest", "-q"]})}},
+        {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1",
+                                               "output": json.dumps({"output": "1 failed", "metadata": {"exit_code": 1}})}},
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "The fixture reads the old key."}},
+    ]
+    path = folder / "rollout-2026-10-25T11-00-00-cdx-2222.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    return path
+
+
+def test_gemini_and_codex_conversations(tmp_path, monkeypatch):
+    project = tmp_path / "shop"
+    project.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    write_conversation(tmp_path / "claude-home", project)
+    write_gemini_chat(tmp_path, project)
+    write_codex_rollout(tmp_path, project)
+    listed = conclave_context.conversations(project)
+    assert sorted(c.tool for c in listed) == ["claude", "gemini", "openai"]
+    gemini = next(c for c in listed if c.tool == "gemini")
+    assert (gemini.id, gemini.title, gemini.messages, gemini.errors) == ("gem-1111", "Build fails on token", 2, 1)
+    codex = next(c for c in listed if c.tool == "openai")
+    assert (codex.id, codex.title, codex.errors, codex.branch) == ("cdx-2222", "Make the tests pass", 1, "main")
+    assert [p for p, _, n in conclave_context.projects()] == [str(project)]
+    assert conclave_context.projects()[0][2] == 3
+    text = conclave_context.transcript(gemini)
+    assert "Why does the build fail?" in text and "TS2304" in text and "never mind" not in text
+    text = conclave_context.transcript(codex)
+    assert "Make the tests pass" in text and "pytest -q failed" in text and "environment_context" not in text
+    assert "<codex_conversation>" in conclave_context.context_block(None, codex)
+    assert conclave_context.find(project, "1", tools=("gemini",)).id == "gem-1111"
+    _, command = conclave_context.handoff(project, codex, "verdict")
+    assert "codex resume cdx-2222 " in command
+    _, command = conclave_context.handoff(project, gemini, "verdict")
+    assert "gemini --resume gem-1111 --prompt-interactive " in command
+
+
 def test_unknown_conversation_is_a_usage_error(fake_bin, tmp_path):
     result = run_cli(fake_bin, "-c", "nope", "Fix it", tmp_path=tmp_path)
-    assert result.returncode == 2 and "no Claude Code conversation" in result.stderr
+    assert result.returncode == 2 and "no conversation 'nope'" in result.stderr
 
 
 def test_hand_off_to_one_agent(fake_bin, tmp_path):
@@ -927,7 +997,7 @@ def test_interactive_conversation_and_handoff(fake_bin, tmp_path):
     project.mkdir()
     write_conversation(tmp_path / "claude-home", project)
     term = Terminal(fake_bin, tmp_path, cwd=project)
-    term.expect("This folder has 1 Claude Code conversation")
+    term.expect("This folder has 1 conversation (Claude Code)")
     term.expect("❯")
     term.command("/convos", "Make the tests pass", "1 error")
     term.command("/attach latest", "Attached")
