@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Let Claude lead a task, consult Gemini and Codex, then synthesize their opinions."""
+"""Let Claude lead a task, consult Gemini and ChatGPT (and any other agent), then synthesize their opinions."""
 
 from __future__ import annotations
 
@@ -38,9 +38,14 @@ import conclave_context
 from conclave_agents import AGENTS
 
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
-ALIASES = {"codex": "openai"}
+ALIASES = {"codex": "openai", "gpt": "openai", "chatgpt": "openai", "council": "council"}
+
+
+def handle(agent: str) -> str:
+    """What you type for an agent: @chatgpt rather than its internal id."""
+    return "chatgpt" if agent == "openai" else agent
 # Views of conclave_agents.AGENTS, rebuilt by sync_agents() when the config adds agents.
 PROVIDERS: dict[str, str] = {}
 LABELS: dict[str, str] = {}
@@ -64,56 +69,80 @@ _running_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------- themes
+#
+# Conclave is a module of SP_SYS: the look comes from the author's own projects rather than a borrowed one.
+# Each theme is lifted from one of those projects' sources (as recorded in the sp-sys-portfolio dossiers), and
+# every agent wears the accent of a project too, the way each portfolio dossier wears its project's identity.
 
+# Each agent's box wears its own maker's colours, so you can tell at a glance who is talking: (colour, second
+# colour its border shifts toward while it works, the box's background).
+AGENT_STYLE = {
+    "claude": ("#D97757", "#F0A988", "#1A1714"),  # Claude's clay on warm dark
+    "gemini": ("#4F8FF7", "#B57CD8", "#0F1218"),  # Gemini's blue, shifting to its purple
+    "openai": ("#10A37F", "#E8E8E8", "#0A0A0A"),  # OpenAI green and white on black
+    "qwen": ("#7C6CF2", "#A99BFF", "#100F1A"),  # Qwen purple
+    "copilot": ("#A371F7", "#E26DB7", "#0D1117"),  # Copilot purple-pink on GitHub dark
+    "opencode": ("#FAB283", "#F5E1C8", "#141210"),  # OpenCode peach
+    "ollama": ("#E5E5E5", "#9A9A9A", "#101010"),  # Ollama's plain white
+}
+AGENT_COLORS = {agent: style[0] for agent, style in AGENT_STYLE.items()}
 THEMES = {
-    "violet": {
-        "ink": "#0A0C13", "edge": "#343746", "accent": "#A5A3FF", "muted": "#6B6E85",
+    "sys": {  # SP_SYS_01, the portfolio: warm ink on near-black, one signal red
+        "ink": "#07070A", "panel": "#0D0D11", "fg": "#EEEBE4", "soft": "#B9B6AE", "muted": "#85837D", "edge": "#2A2A30",
+        "accent": "#E50914", "accent2": "#FF6B73", "good": "#4ADE80", "warn": "#FFB547", "bad": "#FF9F43",
+        "gradient": ("#EEEBE4", "#EEEBE4", "#B9B6AE"),
+    },
+    "branchhq": {  # Branch HQ's renderer: night sky, one purple
+        "ink": "#05060B", "panel": "#0A0C13", "fg": "#ECEFF7", "soft": "#C3C8D8", "muted": "#8B91A7", "edge": "#262A3A",
+        "accent": "#8B88F0", "accent2": "#A5A3FF", "good": "#8BE9A8", "warn": "#F0C878", "bad": "#FF6B7A",
         "gradient": ("#E4E3FF", "#A5A3FF", "#6F6CE0"),
-        "colors": {"claude": "#A5A3FF", "gemini": "#8B88F0", "openai": "#C2C0FF"},
     },
-    "ember": {
-        "ink": "#120B0A", "edge": "#3D2B26", "accent": "#FF9F6B", "muted": "#8A6F66",
-        "gradient": ("#FFE3C2", "#FF9F6B", "#E0466F"),
-        "colors": {"claude": "#FF9F6B", "gemini": "#FFC46B", "openai": "#FF7A93"},
+    "ring0": {  # RING0: ink on graphite, scheduler amber and teal
+        "ink": "#0A0B0D", "panel": "#0E1013", "fg": "#EEECE6", "soft": "#B4B2A9", "muted": "#8D8C85", "edge": "#23262B",
+        "accent": "#FFB547", "accent2": "#4FD8C4", "good": "#4FD8C4", "warn": "#FFD166", "bad": "#FF6B5A",
+        "gradient": ("#EEECE6", "#FFB547", "#FF8A3D"),
     },
-    "aurora": {
-        "ink": "#071312", "edge": "#22403B", "accent": "#5EEAD4", "muted": "#5F8A82",
-        "gradient": ("#D9FFF5", "#5EEAD4", "#6C8CFF"),
-        "colors": {"claude": "#5EEAD4", "gemini": "#7DD3FC", "openai": "#A5B4FC"},
+    "mend": {  # MEND: mint and parity blue on black
+        "ink": "#08090A", "panel": "#0D0F10", "fg": "#EBE8E1", "soft": "#A9A69E", "muted": "#8C8981", "edge": "#1D2021",
+        "accent": "#5DEFB0", "accent2": "#7F9CFF", "good": "#5DEFB0", "warn": "#F7D070", "bad": "#FF7A6B",
+        "gradient": ("#EBE8E1", "#5DEFB0", "#7F9CFF"),
     },
-    "matrix": {
-        "ink": "#050A05", "edge": "#1E3A1E", "accent": "#4ADE80", "muted": "#4F7A55",
-        "gradient": ("#D1FADF", "#4ADE80", "#15803D"),
-        "colors": {"claude": "#4ADE80", "gemini": "#A3E635", "openai": "#86EFAC"},
+    "spherex": {  # SPHEREx: infrared coral and catalogue cyan on deep space
+        "ink": "#04060C", "panel": "#080C18", "fg": "#E9EDF7", "soft": "#B4BCD3", "muted": "#7D87A3", "edge": "#18203A",
+        "accent": "#FF6B4A", "accent2": "#4FD8FF", "good": "#7BE495", "warn": "#FFC857", "bad": "#FF6B4A",
+        "gradient": ("#E9EDF7", "#4FD8FF", "#FF6B4A"),
     },
-    "mono": {
-        "ink": "#0B0B0C", "edge": "#333336", "accent": "#F4F4F5", "muted": "#737378",
-        "gradient": ("#FFFFFF", "#D4D4D8", "#71717A"),
-        "colors": {"claude": "#F4F4F5", "gemini": "#D4D4D8", "openai": "#A1A1AA"},
+    "kakeya": {  # Kakeya Records: paper-dark with coral
+        "ink": "#141416", "panel": "#1D1D20", "fg": "#ECECEE", "soft": "#C4C4CA", "muted": "#9A9AA2", "edge": "#2C2C31",
+        "accent": "#EF7A52", "accent2": "#9AA0A6", "good": "#8FD3A0", "warn": "#F2C46D", "bad": "#EF7A52",
+        "gradient": ("#ECECEE", "#ECECEE", "#EF7A52"),
     },
 }
-GOOD = "#8BE9A8"
-WARN = "#F0C878"
-BAD = "#FF6B7A"
+THEME_ALIASES = {"violet": "branchhq", "ember": "kakeya", "aurora": "spherex", "matrix": "mend", "mono": "sys"}
+DEFAULT_THEME = "sys"
+GOOD, WARN, BAD = "#4ADE80", "#FFB547", "#FF9F43"
 
 
 def apply_theme(name: str) -> None:
     """Switch every colour the interface draws with; they are read at render time."""
-    global THEME, INK, EDGE, ACCENT, MUTED, GRADIENT, COLORS
+    global THEME, INK, PANEL, FG, SOFT, EDGE, ACCENT, ACCENT2, MUTED, GOOD, WARN, BAD, GRADIENT, COLORS
+    name = THEME_ALIASES.get(name, name)
     theme = THEMES[name]
     THEME = name
-    INK, EDGE, ACCENT, MUTED = theme["ink"], theme["edge"], theme["accent"], theme["muted"]
+    INK, PANEL, FG, SOFT, MUTED, EDGE = (theme[key] for key in ("ink", "panel", "fg", "soft", "muted", "edge"))
+    ACCENT, ACCENT2, GOOD, WARN, BAD = (theme[key] for key in ("accent", "accent2", "good", "warn", "bad"))
     GRADIENT = theme["gradient"]
     COLORS = theme_colors(name)
 
 
 def theme_colors(name: str) -> dict[str, str]:
-    """Each agent's colour in a theme. Agents beyond the three a theme names get distinct colours tinted toward its accent."""
-    theme = THEMES[name]
-    colors = dict(theme["colors"])
-    extras = ("#F0A6CA", "#9BE7C4", "#F7C978", "#8FB8FF", "#E8A0FF", "#7FE0E0", "#FFB38A")
+    """Each agent's colour: its maker's colour for the built-in agents, and distinct colours tinted toward the
+    theme for agents added in the config."""
+    theme = THEMES[THEME_ALIASES.get(name, name)]
+    colors = dict(AGENT_COLORS)
+    extras = ("#EF7A52", "#E8731A", "#7F9CFF", "#FFD166", "#4FD0DA", "#E8A0FF")
     for i, agent_id in enumerate(a for a in AGENTS if a not in colors):
-        colors[agent_id] = blend(extras[i % len(extras)], theme["accent"], 0.25)
+        colors[agent_id] = blend(extras[i % len(extras)], theme["accent"], 0.15)
     return colors
 
 
@@ -163,7 +192,7 @@ def load_config(path: Path) -> Settings:
     if not isinstance(ui, dict):
         raise ValueError(f"[ui] in {path} must be a table")
     theme = ui.get("theme")
-    if theme is not None and theme not in THEMES:
+    if theme is not None and THEME_ALIASES.get(theme, theme) not in THEMES:
         raise ValueError(f"Unknown theme {theme!r} in [ui] in {path}; choose from {', '.join(THEMES)}")
     sessions = data.get("sessions", {})
     if not isinstance(sessions, dict) or not isinstance(sessions.get("save", True), bool):
@@ -191,22 +220,34 @@ def load_models(path: Path) -> dict[str, str]:
 class SessionPlan:
     """How a call is kept in the provider's own session history.
 
-    Claude: start session `id` named `name`, or with `resume` continue it. Gemini: record it as session `id`.
-    Codex: keep the session (Codex picks its own id; Stream reads it from the thread.started event).
+    Claude: start session `id` named `name`. Gemini: record it as session `id`. Codex: keep the session (Codex
+    picks its own id; Stream reads it from the thread.started event). With `resume`, all three continue session `id`.
     """
     id: str = ""
     name: str = ""
     resume: bool = False
 
 
+ACCESS_LEVELS = ("read", "edit", "full")
+ACCESS_NOTES = {
+    "read": "agents only read: they can't change files or run commands",
+    "edit": "agents may edit files in the project (ChatGPT may also run commands in its sandbox)",
+    "full": "agents may edit files and run any command on this computer, with no prompts",
+}
+
+
 def command_for(provider: str, prompt: str, model: str | None, structured: bool = True,
-                session: SessionPlan | None = None) -> tuple[list[str], str | None]:
+                session: SessionPlan | None = None, access: str = "read") -> tuple[list[str], str | None]:
     """The command line for one provider. Structured output streams JSON events so the dashboard can show work as
     it happens; plain output is the fallback when those events can't be read. Without a session plan the call
-    leaves no session behind where the CLI allows that."""
+    leaves no session behind where the CLI allows that. `access` picks each tool's own permission mode: read-only
+    planning, file edits, or full access."""
     if provider == "claude":
         output = ["stream-json", "--verbose", "--include-partial-messages"] if structured else ["text"]
-        cmd = ["claude", "-p", "--output-format", *output, "--permission-mode", "plan", "--permission-prompts", "none"]
+        permission = {"read": ["--permission-mode", "plan", "--permission-prompts", "none"],
+                      "edit": ["--permission-mode", "acceptEdits", "--permission-prompts", "none"],
+                      "full": ["--dangerously-skip-permissions"]}[access]
+        cmd = ["claude", "-p", "--output-format", *output, *permission]
         if session and session.resume:
             cmd += ["--resume", session.id]
         elif session:
@@ -218,14 +259,25 @@ def command_for(provider: str, prompt: str, model: str | None, structured: bool 
         return cmd, prompt
     if provider == "gemini":
         # Piped stdin puts Gemini in headless mode and avoids argv length limits on long prompts.
-        cmd = ["gemini", "--approval-mode", "plan", "--output-format", "stream-json" if structured else "text"]
-        if session:
+        approval = {"read": "plan", "edit": "auto_edit", "full": "yolo"}[access]
+        cmd = ["gemini", "--approval-mode", approval, "--output-format", "stream-json" if structured else "text"]
+        if session and session.resume:
+            cmd += ["--resume", session.id]
+        elif session:
             cmd += ["--session-id", session.id]
         if model:
             cmd += ["--model", model]
         return cmd, prompt
     if provider == "openai":
-        cmd = ["codex", "exec", *(["--json"] if structured else []), "--sandbox", "read-only", "--skip-git-repo-check"]
+        sandbox = {"read": ["--sandbox", "read-only"], "edit": ["--sandbox", "workspace-write"],
+                   "full": ["--dangerously-bypass-approvals-and-sandbox"]}[access]
+        if session and session.resume:
+            # `codex exec resume` has no --sandbox flag; the same setting goes in as a config override.
+            sandbox = {"read": ["-c", 'sandbox_mode="read-only"'], "edit": ["-c", 'sandbox_mode="workspace-write"'],
+                       "full": sandbox}[access]
+            cmd = ["codex", "exec", "resume", *(["--json"] if structured else []), *sandbox, "--skip-git-repo-check"]
+            return cmd + (["--model", model] if model else []) + [session.id, "-"], prompt
+        cmd = ["codex", "exec", *(["--json"] if structured else []), *sandbox, "--skip-git-repo-check"]
         if not session:
             cmd += ["--ephemeral"]
         if model:
@@ -233,17 +285,67 @@ def command_for(provider: str, prompt: str, model: str | None, structured: bool 
         return cmd + ["-"], prompt
     # Every other agent gets the prompt on stdin, and runs in its read-only or planning mode where it has one.
     if provider == "qwen":
-        cmd = ["qwen", "--approval-mode", "plan", "--output-format", "stream-json" if structured else "text"]
+        approval = {"read": "plan", "edit": "auto-edit", "full": "yolo"}[access]
+        cmd = ["qwen", "--approval-mode", approval, "--output-format", "stream-json" if structured else "text"]
         return cmd + (["--model", model] if model else []), prompt
     if provider == "copilot":
-        cmd = ["copilot", "-s", "--deny-tool=write", "--deny-tool=shell"]
+        tools = {"read": ["--deny-tool=write", "--deny-tool=shell"], "edit": ["--allow-tool=write", "--deny-tool=shell"],
+                 "full": ["--allow-all-tools"]}[access]
+        cmd = ["copilot", "-s", *tools]
         return cmd + (["--model", model] if model else []), prompt
     if provider == "opencode":
-        return ["opencode", "run", "--agent", "plan"] + (["--model", model] if model else []), prompt
+        agent = "plan" if access == "read" else "build"
+        return ["opencode", "run", "--agent", agent] + (["--model", model] if model else []), prompt
     if provider == "ollama":
         return ["ollama", "run", model or "llama3.2"], prompt
     agent = AGENTS[provider]
     return [part.replace("{model}", model or "") for part in agent.command], prompt
+
+
+SEEN_MODELS: dict[str, str] = {}  # agent -> the model its CLI last reported running
+
+
+def configured_model(agent: str) -> str:
+    """The model an agent's own tool is set to use when Conclave doesn't pick one: from its settings file or
+    environment, or "" when it uses its built-in default."""
+    home = Path.home()
+
+    def json_key(path: Path, *keys: str) -> str:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, dict):
+            value = value.get("name")
+        return value if isinstance(value, str) else ""
+
+    if agent == "claude":
+        return os.environ.get("ANTHROPIC_MODEL") or json_key(home / ".claude" / "settings.json", "model")
+    if agent == "gemini":
+        return os.environ.get("GEMINI_MODEL") or json_key(home / ".gemini" / "settings.json", "model")
+    if agent == "qwen":
+        return json_key(home / ".qwen" / "settings.json", "model")
+    if agent == "openai":
+        try:
+            config = tomllib.loads((Path(os.environ.get("CODEX_HOME") or home / ".codex") / "config.toml").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        return config.get("model") if isinstance(config.get("model"), str) else ""
+    if agent == "opencode":
+        return json_key(home / ".config" / "opencode" / "opencode.json", "model")
+    if agent == "copilot":
+        return json_key(home / ".copilot" / "config.json", "model")
+    if agent == "ollama":
+        return "llama3.2"
+    return ""
+
+
+def model_for(agent: str, selected: dict[str, str | None]) -> str:
+    """The model to show for an agent: the one Conclave was told to use, else the one its CLI last reported, else
+    its tool's own setting."""
+    return selected.get(agent) or SEEN_MODELS.get(agent) or configured_model(agent) or "default model"
 
 
 def continue_command(provider: str, session_id: str, cwd: Path | str) -> str:
@@ -303,6 +405,7 @@ class Stream:
         self.tokens_out = 0
         self.cost = 0.0
         self.session_id = ""
+        self.model = ""  # the model the CLI says it is running, when it says
 
     @property
     def live(self) -> str:
@@ -323,9 +426,15 @@ class Stream:
         reader = AGENTS[self.provider].reader
         {"claude": self._claude, "gemini": self._gemini, "codex": self._codex}.get(reader, lambda _event: None)(event)
 
+    def saw_model(self, model) -> None:
+        if isinstance(model, str) and model:
+            self.model = SEEN_MODELS[self.provider] = model
+
     def _claude(self, event: dict) -> None:
         kind = event.get("type")
-        if kind == "stream_event" and event.get("parent_tool_use_id") is None:
+        if kind == "system" and event.get("subtype") == "init":
+            self.saw_model(event.get("model"))
+        elif kind == "stream_event" and event.get("parent_tool_use_id") is None:
             inner = event.get("event") or {}
             step = inner.get("type")
             if step == "message_start":
@@ -366,7 +475,9 @@ class Stream:
 
     def _gemini(self, event: dict) -> None:
         kind = event.get("type")
-        if kind == "message" and event.get("role") == "assistant":
+        if kind == "init":
+            self.saw_model(event.get("model"))
+        elif kind == "message" and event.get("role") == "assistant":
             content = event.get("content") or ""
             self.text = self.text + content if event.get("delta") else content
             self.activity = "writing"
@@ -381,6 +492,8 @@ class Stream:
             self.activity = first_line(message)
         elif kind == "result":
             stats = event.get("stats") or {}
+            if isinstance(stats.get("models"), dict) and stats["models"]:
+                self.saw_model(next(iter(stats["models"])))
             self.tokens_in = int(stats.get("input_tokens") or 0)
             self.tokens_out = int(stats.get("output_tokens") or 0)
             if event.get("status") == "error":
@@ -485,7 +598,8 @@ class Control:
 
 
 def ask(provider: str, prompt: str, model: str | None, timeout: int, watch=None,
-        cwd: Path | str | None = None, control: Control | None = None, session: SessionPlan | None = None) -> Reply:
+        cwd: Path | str | None = None, control: Control | None = None, session: SessionPlan | None = None,
+        access: str = "read") -> Reply:
     """Run one provider CLI in `cwd`, calling watch(stream) as its output arrives, and return its Reply.
 
     If the CLI streams JSON that holds no answer Conclave can read (say its event format changed), it is asked once
@@ -495,7 +609,8 @@ def ask(provider: str, prompt: str, model: str | None, timeout: int, watch=None,
     if not shutil.which(binary):
         raise RuntimeError(f"{binary} is not installed (not found on PATH).")
     try:
-        return call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=True, session=session)
+        return call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=True, session=session,
+                        access=access)
     except EmptyAnswer as exc:
         if not exc.structured:
             raise
@@ -503,18 +618,18 @@ def ask(provider: str, prompt: str, model: str | None, timeout: int, watch=None,
         fallback = Stream(provider)
         fallback.activity = "retrying with plain output"
         watch(fallback)
-    reply = call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=False)
+    reply = call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=False, access=access)
     reply.session_id = ""
     return reply
 
 
 def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch, cwd, control, structured: bool,
-             session: SessionPlan | None = None) -> Reply:
+             session: SessionPlan | None = None, access: str = "read") -> Reply:
     binary = PROVIDERS[provider]
     if control and control.cancelled.is_set():
         raise Cancelled()
 
-    command, stdin = command_for(provider, prompt, model, structured, session)
+    command, stdin = command_for(provider, prompt, model, structured, session, access)
     try:
         # A separate process group lets a timeout or Ctrl+C stop the CLI's child processes too.
         proc = subprocess.Popen(
@@ -621,7 +736,7 @@ def blend(start: str, end: str, amount: float) -> str:
     return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(a, b))
 
 
-apply_theme("violet")
+apply_theme(DEFAULT_THEME)
 
 
 def pulse(period: float = 1.6) -> float:
@@ -664,12 +779,14 @@ def gradient(line: str, sweep: float | None = None) -> Text:
     return text
 
 
-def banner_line(line: str, sweep: float | None = None) -> Text:
-    """Draw a banner row: solid coloured cells for █ and a darker shade for the box-drawing shadow.
+def banner_line(line: str, sweep: float | None = None, row: int = 0) -> Text:
+    """Draw a banner row: solid coloured cells for █ and a darker shade for the box-drawing shadow, then on the
+    bottom rows a full stop in the signal colour, the way the portfolio ends "Pandey." in red.
 
     Background-coloured spaces look solid in every terminal font, unlike the █ glyph.
     """
     text = Text()
+    stop = row in (3, 4)
     for i, char in enumerate(line):
         color = shade(i, len(line), sweep)
         if char == "█":
@@ -679,7 +796,34 @@ def banner_line(line: str, sweep: float | None = None) -> Text:
         else:
             # The box-drawing shadow becomes a solid darker cell: thin line glyphs look like a grid in some fonts.
             text.append(" ", style=f"on {blend(color, INK, 0.72)}")
+    if len(line) > 20:
+        text.append(" ")
+        text.append("   ", style=f"on {ACCENT}" if stop else "")
     return text
+
+
+# Each agent's box has its own frame: soft for Claude, twin lines for Gemini, crisp and square for Codex.
+AGENT_FRAMES = {"claude": box.ROUNDED, "gemini": box.DOUBLE, "openai": box.SQUARE, "qwen": box.HEAVY,
+                "copilot": box.ROUNDED, "opencode": box.SQUARE, "ollama": box.SQUARE}
+
+
+def agent_style(name: str) -> tuple[str, str, str]:
+    """(colour, the colour its border shifts toward while working, its box's background)."""
+    if name in AGENT_STYLE:
+        return AGENT_STYLE[name]
+    color = COLORS[name]
+    return color, blend(color, FG, 0.45), blend(INK, color, 0.05)
+
+
+# HUD corner brackets instead of a full frame: the SP_SYS box.
+BRACKETS = box.Box("┌  ┐\n    \n    \n    \n    \n    \n    \n└  ┘\n")
+
+
+def label(text: str, note: str = "") -> Text:
+    """A panel title in the SP_SYS style: [ LABEL ] in the signal colour, then an optional muted note."""
+    title = Text.assemble((" [ ", f"bold {ACCENT}"), (text.upper(), f"bold {FG}"), (" ]", f"bold {ACCENT}"))
+    title.append(f" {note} " if note else " ", style=MUTED)
+    return title
 
 
 def pill(label: str, color: str, background: str) -> Text:
@@ -737,15 +881,15 @@ def fix_for(provider: str, error: str) -> str:
 
 def explain(provider: str, headline: str, error: str) -> None:
     """Show why a model failed and, when we can tell, the command that fixes it."""
-    body = [Text(error, style="#E8E8F5")]
+    body = [Text(error, style=FG)]
     fix = fix_for(provider, error)
     if fix:
         body += [Text(""), Text.assemble(("→ ", f"bold {ACCENT}"), (fix, f"bold {ACCENT}"))]
     console.print(Panel(
         Group(*body),
-        title=Text(f" ✗ {headline} ", style=f"bold {BAD}"),
+        title=Text.assemble((" [ ", f"bold {BAD}"), ("FAULT", f"bold {BAD}"), (" ] ", f"bold {BAD}"), (headline + " ", FG)),
         title_align="left",
-        box=box.ROUNDED,
+        box=BRACKETS,
         border_style=BAD,
         style=f"on {INK}",
         padding=(1, 2),
@@ -843,11 +987,13 @@ class Dashboard:
     pulses, comets, streaming text and clocks keep moving between reports."""
 
     def __init__(self, selected: dict[str, str | None], task: str, cross_examine: bool = False,
-                 advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS):
-        self.members = ("claude", *advisers)
-        self.phases = phases_for(cross_examine and len(advisers) > 1)
+                 advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS, solo: str | None = None):
+        self.members = (solo,) if solo else ("claude", *advisers)
+        self.speaker = solo or "claude"  # whose answer streams into the big pane
+        self.phases = ((("solo", f"{SESSION_NAMES[solo].upper()} · HAND-OFF"),) if solo
+                       else phases_for(cross_examine and len(advisers) > 1))
         self.states = {
-            name: {"status": "waiting", "stage": "standing by", "model": selected.get(name) or "default", "preview": ""}
+            name: {"status": "waiting", "stage": "standing by", "model": model_for(name, selected), "preview": ""}
             for name in self.members
         }
         self.task = task
@@ -864,6 +1010,8 @@ class Dashboard:
         self.mode = mode
         if mode == "split":
             self.phases = SPLIT_PHASES
+        elif mode == "solo":
+            self.phase = "solo"
 
     def plan(self, subtasks: list[dict]) -> None:
         self.subtasks = [dict(task, status="waiting") for task in subtasks]
@@ -894,6 +1042,8 @@ class Dashboard:
         """A callback for ask(): copy the model's streaming text and current activity into its card."""
         def update(stream: Stream) -> None:
             self.states[name]["live"] = stream.live
+            if stream.model:
+                self.states[name]["model"] = stream.model
             if stream.activity:
                 self.states[name]["activity"] = stream.activity
         return update
@@ -902,31 +1052,32 @@ class Dashboard:
         order = [key for key, _ in self.phases]
         current = order.index(self.phase) if self.phase in order else len(order)
         text = Text()
-        for i, (_, label) in enumerate(self.phases):
+        for i, (_, name) in enumerate(self.phases):
             if i:
-                text.append("  ──────  ", style=ACCENT if i <= current else EDGE)
+                text.append("  ────  ", style=ACCENT if i <= current else EDGE)
+            number = f"{i + 1:02d} "
             if i < current:
-                text.append(f"✓ {label}", style=f"bold {ACCENT}")
+                text.append_text(Text.assemble((number, MUTED), (name, SOFT), (" ✓", f"bold {GOOD}")))
             elif i == current:
-                text.append(f"◉ {label}", style=f"bold {blend(ACCENT, '#FFFFFF', pulse() * 0.7)}")
+                text.append_text(Text.assemble((number, f"bold {ACCENT}"), ("▸ " + name, f"bold {blend(FG, ACCENT, pulse() * 0.5)}")))
             else:
-                text.append(f"○ {label}", style=MUTED)
+                text.append_text(Text.assemble((number, EDGE), (name, MUTED)))
         return text
 
     def card(self, name: str, compact: bool, live_lines: int, with_sprite: bool) -> Panel:
         state = self.states[name]
-        color = COLORS[name]
+        color, second, ground = agent_style(name)
         status = state["status"]
         if status == "working":
             glow = pulse()
-            badge = pill("● THINKING", INK, blend(EDGE, color, 0.45 + 0.55 * glow))
-            border = blend(EDGE, color, 0.35 + 0.65 * glow)
+            badge = pill("▸ ACTIVE", "#000000", blend(color, second, glow * 0.5))
+            border = blend(color, second, glow)
         elif status == "done":
-            badge, border = pill("✓ DONE", INK, color), color
+            badge, border = pill("✓ DONE", "#000000", color), color
         elif status == "error":
-            badge, border = pill("✗ FAILED", "#FFFFFF", "#B33A48"), BAD
+            badge, border = pill("✗ FAULT", "#000000", BAD), BAD
         else:
-            badge, border = pill("STANDBY", MUTED, blend(INK, EDGE, 0.5)), EDGE
+            badge, border = pill("STANDBY", MUTED, blend(ground, EDGE, 0.6)), blend(EDGE, color, 0.35)
         headline = [Text.assemble(badge), Text(state["stage"], style=color if status == "working" else MUTED)]
         if status == "working":
             activity = state.get("activity") or ("reading the brief" if name != "claude" else "warming up")
@@ -940,7 +1091,7 @@ class Dashboard:
         else:
             content = [Text.assemble(badge, ("  " + state["stage"], color if status == "working" else MUTED)), *headline[2:]]
         content.append(Track(BAD if status == "error" else color, status))
-        if status == "working":
+        if status == "working" and not (name == self.speaker and self.phase == "solo"):
             live = state.get("live") or ""
             if live and not compact and live_lines:
                 shown = drafting(live) if name == "claude" else live
@@ -957,16 +1108,16 @@ class Dashboard:
         else:
             usage = ""
         subtitle = "  ·  ".join(part for part in (state["model"], usage, timer) if part)
-        role = ROLES.get(name, "ADVISER")
+        role = "HAND-OFF" if self.phase == "solo" else ROLES.get(name, "ADVISER")
         return Panel(
             Group(*content),
             title=Text.assemble((f" {LABELS[name]} ", f"bold {color}"), (f"· {role} ", MUTED)),
             title_align="left",
             subtitle=Text(f" {subtitle} ", style=MUTED),
             subtitle_align="right",
-            box=box.ROUNDED,
+            box=AGENT_FRAMES.get(name, box.SQUARE),
             border_style=border,
-            style=f"on {INK}",
+            style=f"on {ground}",
             padding=(0 if compact else 1, 2),
         )
 
@@ -984,11 +1135,11 @@ class Dashboard:
                     "error": ("✗", f"bold {BAD}")}.get(status, ("○", MUTED))
             timer = elapsed(task) if task.get("started") else ""
             table.add_row(Text(f"{number:>2}", style=MUTED), Text(*icon), Text(LABELS[task["agent"]], style=f"bold {color}"),
-                          Text(task["title"], style="#E8E8F5" if status == "working" else MUTED, overflow="ellipsis",
+                          Text(task["title"], style=FG if status == "working" else MUTED, overflow="ellipsis",
                                no_wrap=True), Text(timer, style=MUTED))
         done = sum(task.get("status") == "done" for task in self.subtasks)
-        return Panel(table, title=Text.assemble(gradient(" ✦ CLAUDE'S PLAN "), (f" {done}/{len(self.subtasks)} done ", MUTED)),
-                     title_align="left", box=box.ROUNDED, border_style=EDGE, style=f"on {INK}", padding=(0, 2))
+        return Panel(table, title=label("Claude's plan", f"{done}/{len(self.subtasks)} done"),
+                     title_align="left", box=BRACKETS, border_style=EDGE, style=f"on {INK}", padding=(0, 2))
 
     def totals(self) -> tuple[int, int]:
         tokens = [state.get("tokens") or (0, 0) for state in self.states.values()]
@@ -1000,17 +1151,18 @@ class Dashboard:
         stats = f" ↑{count(tokens_in)} ↓{count(tokens_out)}  ·  ⏱ {clock(total)} " if tokens_in else f" ⏱ {clock(total)} "
         minds = f" {len(self.members)} minds · one answer " if self.mode == "council" else f" {len(self.subtasks)} subtasks · one answer "
         header = Panel(
-            Group(Text(excerpt(self.task, 160), style="bold #E8E8F5"), Text(""), self.tracker()),
-            title=Text.assemble(gradient(" ✦ CONCLAVE "), (minds, MUTED)),
+            Group(Text(excerpt(self.task, 160), style=f"bold {FG}"), Text(""), self.tracker()),
+            title=Text.assemble((" ■ ", f"bold {blend(ACCENT, INK, 0.6 * pulse(2.0))}"), ("CONCLAVE", f"bold {FG}"),
+                                (" // ", MUTED), (minds.strip().upper() + " ", MUTED)),
             title_align="left",
             subtitle=Text(stats, style=f"bold {ACCENT}"),
             subtitle_align="right",
-            box=box.ROUNDED,
+            box=BRACKETS,
             border_style=EDGE,
             style=f"on {INK}",
             padding=(1, 2),
         )
-        writing = self.phase == "verdict" and self.states["claude"]["status"] == "working"
+        writing = self.phase in ("verdict", "solo") and self.states[self.speaker]["status"] == "working"
         width = console.size.width
         columns = max(1, min(len(self.members), width // 40))
         grid = Table.grid(expand=True, padding=(0, 1))
@@ -1018,7 +1170,7 @@ class Dashboard:
             grid.add_column(ratio=1)
         live_lines = 6 if columns > 1 else 3
         with_sprite = width // columns >= 40
-        cards = [self.card(name, writing, live_lines, with_sprite) for name in self.members]
+        cards = [self.card(name, writing and self.phase == "verdict", live_lines, with_sprite) for name in self.members]
         for i in range(0, len(cards), columns):
             grid.add_row(*cards[i:i + columns])
         parts = [header]
@@ -1035,14 +1187,21 @@ class Dashboard:
         """Claude's verdict, rendered as it streams, in whatever height the terminal has left."""
         used = len(console.render_lines(above, console.options, pad=False))
         height = max(console.size.height - used - 6, 4)
-        text = drafting(self.states["claude"].get("live") or "")
+        text = drafting(self.states[self.speaker].get("live") or "")
+        if self.phase == "solo":
+            color, second, ground = agent_style(self.speaker)
+            activity = self.states[self.speaker].get("activity") or "working"
+            body = Tail(Markdown(text + " ▍"), height) if text else Text(f"{spinner()} {activity}…", style=MUTED)
+            return Panel(body, title=Text.assemble((f" {LABELS[self.speaker]} ", f"bold {color}"), ("· writing ", MUTED)),
+                         title_align="left", box=AGENT_FRAMES.get(self.speaker, box.SQUARE),
+                         border_style=blend(color, second, pulse(2.2)), style=f"on {ground}", padding=(1, 3))
         waiting = "combining the results…" if self.mode == "split" else "weighing the opinions…"
         body = Tail(Markdown(text + " ▍"), height) if text else Text(f"{spinner()} {waiting}", style=MUTED)
         return Panel(
             body,
-            title=Text.assemble(gradient(" ✦ VERDICT "), (" drafting ", MUTED)),
+            title=label("Verdict", "drafting"),
             title_align="left",
-            box=box.HEAVY,
+            box=BRACKETS,
             border_style=blend(EDGE, ACCENT, 0.4 + 0.6 * pulse(2.2)),
             style=f"on {INK}",
             padding=(1, 3),
@@ -1068,7 +1227,10 @@ class Round:
     sessions: dict[str, str] = field(default_factory=dict)  # provider -> command that continues its saved session
     rebuttals: dict[str, str] = field(default_factory=dict)  # provider -> its critique of the other advisers
     advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS
-    mode: str = "council"  # or "split", when Claude handed out subtasks
+    mode: str = "council"  # "split" when Claude handed out subtasks, "solo" for a hand-off to one agent
+    speaker: str = "claude"  # whose answer `final` is
+    access: str = "read"
+    thread: str = ""  # on a hand-off, the agent's own session id, so a follow-up can carry on in it
     plan: list[dict] = field(default_factory=list)  # subtasks: agent, title, instructions, result or error
 
     def opinion(self, name: str) -> str:
@@ -1414,16 +1576,75 @@ def run_subtasks(task: str, plan: list[dict], advisers: tuple[str, ...], view, p
     return plan
 
 
+SOLO_JOB = {
+    "read": "Answer the user's request below. You may read the project's files, but don't change anything.",
+    "edit": ("Carry out the user's request below in the project: make the changes it needs. When you're done, say "
+             "briefly what you changed and anything left to do."),
+    "full": ("Carry out the user's request below. You may edit files and run commands. When you're done, say briefly "
+             "what you did and anything left to do. Ask before anything irreversible, such as sending a message, "
+             "deleting data or spending money."),
+}
+
+
+def apply_task(request: str, verdict: str) -> str:
+    """The task that has an agent carry out a verdict in the project."""
+    return (f"Carry out this plan in the project. It is the verdict on the request \"{request}\". Make the changes, run "
+            f"the project's tests or checks if it has them, and report what you changed.\n\n<plan>\n{verdict}\n</plan>")
+
+
+def solo(task: str, agent: str, selected: dict[str, str | None], timeout: int, view, cwd: Path | str | None = None,
+         control: Control | None = None, title: str = "", save_sessions: bool = False, access: str = "read",
+         resume: str = "") -> Round:
+    """Hand a task straight to one agent, at the given access level, and keep its session so you can carry on there.
+    With `resume` (a session id from an earlier hand-off) the agent continues that conversation, as it would in its
+    own tool."""
+    result = Round(task, advisers=(), mode="solo", speaker=agent, access=access)
+    started = time.monotonic()
+    folder = Path(cwd or Path.cwd())
+    session = None
+    if resume and saves_sessions(agent):
+        session = SessionPlan(resume, resume=True)
+    elif save_sessions and saves_sessions(agent):
+        session = SessionPlan(str(uuid.uuid4()), f"Conclave · {excerpt(title or task, 70)}") if agent != "openai" else SessionPlan()
+    view.set_mode("solo")
+    view.start(agent, f"{'carrying on' if session and session.resume else 'working'} · {access} access")
+    try:
+        reply = ask(agent, f"{SOLO_JOB[access]} {MATERIAL}\n\n{task}", selected.get(agent), timeout, view.watch(agent),
+                    cwd=cwd, control=control, session=session, access=access)
+    except RuntimeError as exc:
+        view.finish(agent, "error", "couldn't finish", excerpt(str(exc)))
+        result.errors.append((agent, f"{LABELS[agent]} COULDN'T FINISH THE HAND-OFF", str(exc)))
+    else:
+        view.tokens(agent, reply.tokens_in, reply.tokens_out)
+        result.add(reply)
+        result.final = reply.text
+        if session and session.resume and not reply.session_id:
+            reply.session_id = session.id
+        if reply.session_id:
+            result.thread = reply.session_id
+            result.sessions[agent] = continue_command(agent, reply.session_id, folder)
+        view.finish(agent, "done", "done", preview(reply.text))
+    finally:
+        view.done()
+        result.seconds = time.monotonic() - started
+    return result
+
+
 def council(task: str, title: str, selected: dict[str, str | None], timeout: int, cwd: Path | None = None,
             save_sessions: bool = False, cross_examine: bool = False,
-            advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS, split: str = "never") -> Round:
-    """A round in the terminal, with the live dashboard. On Ctrl+C the model calls are stopped and KeyboardInterrupt
-    propagates."""
-    board = Dashboard(selected, title, cross_examine, advisers)
+            advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS, split: str = "never",
+            agent: str | None = None, access: str = "read", resume: str = "") -> Round:
+    """A round in the terminal, with the live dashboard: the council, or with `agent` a hand-off to that one agent.
+    On Ctrl+C the model calls are stopped and KeyboardInterrupt propagates."""
+    board = Dashboard(selected, title, cross_examine, advisers, solo=agent)
     try:
         with Live(board, console=console, refresh_per_second=12):
-            result = deliberate(task, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions,
-                                cross_examine=cross_examine, advisers=advisers, split=split)
+            if agent:
+                result = solo(task, agent, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions,
+                              access=access, resume=resume)
+            else:
+                result = deliberate(task, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions,
+                                    cross_examine=cross_examine, advisers=advisers, split=split)
     except KeyboardInterrupt:
         stop_all()
         raise
@@ -1434,6 +1655,8 @@ def council(task: str, title: str, selected: dict[str, str | None], timeout: int
 
 
 def helpers_line(result: Round) -> str:
+    if result.mode == "solo":
+        return f"{SESSION_NAMES[result.speaker]} · {result.access} access"
     if result.mode == "split":
         return f"{sum('result' in t for t in result.plan)}/{len(result.plan)} subtasks"
     return f"{len(result.advisers) - len(result.failed)}/{len(result.advisers)} advisers"
@@ -1450,7 +1673,8 @@ def round_meta(result: Round) -> str:
 
 def write_report(result: Round, show_opinions: bool, output: Path | None) -> str:
     """Print the verdict (and opinions when asked), save it to output if given, and return it as Markdown."""
-    sections = [("claude", "✦ VERDICT", result.final)] if result.final else []
+    headline = f"{LABELS[result.speaker]} · ANSWER" if result.mode == "solo" else "✦ VERDICT"
+    sections = [(result.speaker, headline, result.final)] if result.final else []
     if show_opinions or not result.final:
         heading = "SUBTASKS" if result.mode == "split" else "OPINION"
         sections += [(name, f"{LABELS[name]} · {heading}", result.opinion(name))
@@ -1462,25 +1686,32 @@ def write_report(result: Round, show_opinions: bool, output: Path | None) -> str
     if sys.stdout.isatty():
         out = Console()
         out.print()
-        for name, title, body in sections:
-            if name == "claude":
+        for i, (name, title, body) in enumerate(sections):
+            if i == 0 and result.final and result.mode == "solo":
+                color, _, ground = agent_style(name)
+                out.print(Panel(Markdown(body), title=Text(f" {title} ", style=f"bold {color}"), title_align="left",
+                                subtitle=Text(f" {round_meta(result)} ", style=MUTED), subtitle_align="right",
+                                box=AGENT_FRAMES.get(name, box.SQUARE), border_style=color, style=f"on {ground}", padding=(1, 3)))
+            elif i == 0 and result.final:
                 content = [Markdown(body)]
                 if result.agreement or result.confidence:
                     content += [Text(""), Rule(style=EDGE), meter(result.agreement, result.confidence)]
                 out.print(Panel(
                     Group(*content),
-                    title=gradient(f" {title} "),
+                    title=label(title.replace("✦", "").strip()),
                     title_align="left",
                     subtitle=Text(f" {round_meta(result)} ", style=MUTED),
                     subtitle_align="right",
-                    box=box.HEAVY,
+                    box=BRACKETS,
                     border_style=ACCENT,
                     style=f"on {INK}",
                     padding=(1, 3),
                 ))
             else:
-                out.print(Panel(Markdown(body), title=Text(f" {title} ", style=f"bold {COLORS[name]}"), title_align="left",
-                                box=box.ROUNDED, border_style=blend(EDGE, COLORS[name], 0.6), style=f"on {INK}", padding=(1, 3)))
+                color, _, ground = agent_style(name)
+                out.print(Panel(Markdown(body), title=Text(f" {title} ", style=f"bold {color}"), title_align="left",
+                                box=AGENT_FRAMES.get(name, box.SQUARE), border_style=blend(EDGE, color, 0.7),
+                                style=f"on {ground}", padding=(1, 3)))
     else:
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
@@ -1502,7 +1733,7 @@ def show_sessions(result: Round, interactive: bool = False) -> None:
     """Where each model's part of the round was saved, and the command that continues it in that tool."""
     if not result.sessions:
         return
-    order = ("claude", *result.advisers)
+    order = tuple(dict.fromkeys((result.speaker, "claude", *result.advisers)))
     if not console.is_terminal:
         for name in order:
             if name in result.sessions:
@@ -1514,8 +1745,8 @@ def show_sessions(result: Round, interactive: bool = False) -> None:
             table.add_row(Text(f"{LABELS[name].split()[0]} {SESSION_NAMES[name]}", style=f"bold {COLORS[name]}"),
                           Text(result.sessions[name], style=MUTED))
     hint = "/continue <agent> opens one here" if interactive else "run one to keep talking to that model"
-    console.print(Panel(table, title=Text(" ↪ CONTINUE IN EACH MODEL'S OWN TOOL ", style=f"bold {ACCENT}"), title_align="left",
-                        subtitle=Text(f" {hint} ", style=MUTED), subtitle_align="right", box=box.ROUNDED,
+    console.print(Panel(table, title=label("Continue in each model's own tool"), title_align="left",
+                        subtitle=Text(f" {hint} ", style=MUTED), subtitle_align="right", box=BRACKETS,
                         border_style=EDGE, style=f"on {INK}", padding=(0, 2)))
 
 
@@ -1532,7 +1763,7 @@ def run(args: argparse.Namespace, selected: dict[str, str | None], project: Path
     try:
         result = council(compose(args.task, project, conversation), args.title, selected, args.timeout, cwd=project,
                          save_sessions=args.save_sessions, cross_examine=args.cross_examine, advisers=args.advisers,
-                         split=args.split)
+                         split=args.split, agent=args.agent, access=args.access)
     except KeyboardInterrupt:
         console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
         return 130
@@ -1559,14 +1790,14 @@ def hand_back(project: Path, conversation, verdict: str) -> None:
             pass
     console.print(Panel(
         Group(
-            Text.assemble(("Saved ", MUTED), (str(path), "#E8E8F5")),
+            Text.assemble(("Saved ", MUTED), (str(path), FG)),
             Text(""),
             Text("Run this to give the verdict back to Claude Code" + (" (copied to your clipboard):" if copied else ":"), style=MUTED),
             Text(command, style=f"bold {ACCENT}"),
         ),
-        title=gradient(" ↩ HAND BACK TO CLAUDE CODE "),
+        title=label("Hand back to Claude Code"),
         title_align="left",
-        box=box.ROUNDED,
+        box=BRACKETS,
         border_style=EDGE,
         style=f"on {INK}",
         padding=(1, 2),
@@ -1657,7 +1888,7 @@ def health_table(report: list[Health]) -> Group:
 
 def run_visible(command: str, cwd: Path | None = None) -> int:
     """Run a command with the terminal attached, so installers and sign-in flows can talk to the person."""
-    console.print(Text.assemble(("  $ ", f"bold {ACCENT}"), (command, "#E8E8F5")))
+    console.print(Text.assemble(("  $ ", f"bold {ACCENT}"), (command, FG)))
     try:
         return subprocess.run(command, shell=True, cwd=cwd).returncode
     except KeyboardInterrupt:
@@ -1667,7 +1898,7 @@ def run_visible(command: str, cwd: Path | None = None) -> int:
 def setup(ask_first: bool, members: tuple[str, ...] = ("claude", *conclave_agents.DEFAULT_ADVISERS)) -> list[Health]:
     """Check the council's tools; when ask_first, offer to install or sign in to each one that isn't ready."""
     report = [check(name) for name in members]
-    console.print(Panel(health_table(report), title=gradient(" SETUP "), title_align="left", box=box.ROUNDED,
+    console.print(Panel(health_table(report), title=label("Setup"), title_align="left", box=BRACKETS,
                         border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
     if not ask_first:
         return report
@@ -1718,7 +1949,11 @@ BANNER = (
     " ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝",
 )
 COMMANDS = (
-    ("/setup", "check Claude, Gemini and Codex, and install or sign in to any that aren't ready"),
+    ("@<agent> <task>", "hand a task straight to one agent (@claude, @gemini, @chatgpt...); @<agent> alone talks only to it"),
+    ("/to <agent|council>", "where your messages go: one agent, which carries on its own session, or the whole council"),
+    ("/access <read|edit|full>", "what hand-offs may do: read only, edit the project, or full terminal access"),
+    ("/apply [agent]", "have an agent (Claude by default) carry out the last verdict in the project"),
+    ("/setup", "check Claude, Gemini and ChatGPT, and install or sign in to any that aren't ready"),
     ("!<command>", "run a shell command without leaving Conclave (e.g. !git status)"),
     ("/agents [add|remove] [agent]", "list the agents (Qwen, Copilot, OpenCode, Ollama, your own...), or seat and unseat advisers"),
     ("/split [auto|always|never]", "whether Claude may split a big task into subtasks for the agents best suited"),
@@ -1728,12 +1963,12 @@ COMMANDS = (
     ("/detach", "stop sending the attached conversation"),
     ("/project [path|none]", "show or set the project folder the models read and review"),
     ("/handoff", "save the last verdict and show the command that gives it back to Claude Code"),
-    ("/model [provider] [name]", "show the council, or set a model (provider: claude, gemini, codex; name: default resets)"),
-    ("/show <gemini|codex|brief|verdict>", "print the full text from the last round"),
+    ("/model [agent] [name]", "show the council, or set a model (agent: claude, gemini, chatgpt...; name: default resets)"),
+    ("/show <agent|brief|verdict>", "print the full text from the last round"),
     ("/retry", "ask the last question again"),
-    ("/continue <claude|gemini|codex>", "open the last round in that model's own tool and keep talking"),
-    ("/private", "toggle saving rounds as sessions in Claude Code, Gemini CLI and Codex"),
-    ("/opinions", "toggle printing Gemini's and Codex's full replies after each verdict"),
+    ("/continue <agent>", "open the last round in that agent's own tool and keep talking"),
+    ("/private", "toggle saving rounds as sessions in Claude Code, Gemini CLI and ChatGPT's Codex"),
+    ("/opinions", "toggle printing the advisers' full replies after each verdict"),
     ("/theme [name]", "list the colour themes, or switch to one"),
     ("/stats", "time, tokens and cost for this session"),
     ("/timeout <seconds>", "change the time allowed per model call"),
@@ -1761,6 +1996,9 @@ class Session:
         self.prompt = None  # the prompt_toolkit session, so a theme change can restyle it
         self.project: Path | None = None  # the folder the models work in and review
         self.conversation = None  # an attached Claude Code conversation (conclave_context.Conversation)
+        self.target: str | None = None  # where plain messages go: None for the council, or one agent's id
+        self.access = "read"  # what hand-offs may do (the council itself always only reads)
+        self.threads: dict[str, str] = {}  # agent -> its session id, so hand-offs to it carry on one conversation
 
     # -- screens
 
@@ -1777,7 +2015,7 @@ class Session:
             table.add_row(
                 Text(LABELS[name], style=f"bold {COLORS[name]}"),
                 Text(role, style=MUTED),
-                Text(self.selected.get(name) or "provider default", style="#E8E8F5"),
+                Text(model_for(name, self.selected), style=FG),
                 status,
             )
         return table
@@ -1792,6 +2030,11 @@ class Session:
             ("advisers cross-examine each other" if self.cross_examine else "quick (no cross-examination)")
             + {"auto": " · Claude splits big tasks", "always": " · Claude always splits tasks",
                "never": " · never split"}[self.split]))
+        if self.target:
+            session.add_row(Text("talking to", style=MUTED), Text(f"{AGENTS[self.target].name} only · {self.access} access "
+                                                                  "(/to council for everyone)", style=f"bold {COLORS[self.target]}"))
+        elif self.access != "read":
+            session.add_row(Text("hand-offs", style=MUTED), Text(f"{self.access} access", style=f"bold {WARN}"))
         if self.project:
             session.add_row(Text("project", style=MUTED), Text(home(self.project), style=f"bold {ACCENT}"))
         if self.conversation:
@@ -1799,37 +2042,66 @@ class Session:
                             Text(f"{excerpt(self.conversation.title, 60)} · {self.conversation.when}", style=f"bold {ACCENT}"))
         members = ("claude", *self.advisers)
         missing = [name for name in members if not shutil.which(PROVIDERS[name])] if revealed >= len(members) else []
-        fixes = [Text.assemble(("→ ", f"bold {ACCENT}"), (INSTALL[name], ACCENT)) for name in missing]
+        fixes = []
         if missing:
-            fixes.append(Text.assemble(("→ ", f"bold {ACCENT}"), ("or type ", MUTED), ("/setup", f"bold {ACCENT}"),
-                                       (" and Conclave installs them and signs you in", MUTED)))
+            # The commands go on lines of their own, so a copied line pastes into the shell as it is.
+            fixes.append(Text.assemble(("Not installed yet. Type ", MUTED), ("/setup", f"bold {ACCENT}"),
+                                       (" and Conclave installs and signs in to them, or run these yourself:", MUTED)))
+            for name in missing:
+                agent = AGENTS[name]
+                if agent.install_command:
+                    fixes.append(Text(agent.install_command, style=f"bold {ACCENT}"))
+                    if agent.sign_in_command:
+                        fixes.append(Text(agent.sign_in_command, style=f"bold {ACCENT}"))
+                else:
+                    fixes.append(Text(agent.install, style=ACCENT))
         return Panel(
             Group(self.council_table(revealed), *([Text("")] + fixes if fixes else []), Text(""), session),
-            title=gradient(" THE COUNCIL "),
+            title=label("The council"),
             title_align="left",
             subtitle=Text(f" v{__version__} ", style=MUTED),
             subtitle_align="right",
-            box=box.ROUNDED,
+            box=BRACKETS,
             border_style=EDGE,
             style=f"on {INK}",
             padding=(1, 2),
         )
 
+    def boot(self) -> None:
+        """The SP_SYS boot: a few status lines in the signal colour, about a second, once per session."""
+        members = ("claude", *self.advisers)
+        online = [m for m in members if shutil.which(PROVIDERS[m])]
+        try:
+            import getpass
+            operator = getpass.getuser().upper()
+        except (ImportError, OSError, KeyError):
+            operator = "OPERATOR"
+        projects = len(conclave_context.projects())
+        ok = lambda text: (text, f"bold {GOOD}")  # noqa: E731
+        lines = [
+            [("CONCLAVE // COUNCIL OS ", ACCENT), ok("OK")],
+            [("MOUNTING CLAUDE CODE INDEX ... ", ACCENT), ok(f"{projects} PROJECTS")],
+            [("SEATING COUNCIL ... ", ACCENT), (" · ".join(SESSION_NAMES[m].upper() for m in members), SOFT)],
+            [("LINKING PROVIDERS ... ", ACCENT), ok("OK") if len(online) == len(members)
+             else (f"{len(online)}/{len(members)} ONLINE", f"bold {WARN}")],
+            [(f"OPERATOR {operator} ... ", ACCENT), ("AUTHENTICATED", SOFT)],
+            [("> WELCOME.", f"bold {FG}")],
+        ]
+        for parts in lines:
+            console.print(Text("  ") + Text.assemble(*parts))
+            time.sleep(0.17)
+        console.print()
+
     def welcome(self, animate: bool = False) -> None:
         console.print()
-        wide = console.size.width >= len(BANNER[0]) + 4
-        lines = BANNER if wide else ("✦  C O N C L A V E  ✦",)
         if animate:
-            # A band of light sweeps across the banner, then the council checks in one by one.
-            width = len(lines[0])
-            with Live(console=console, refresh_per_second=60, transient=True) as live:
-                for sweep in range(-8, width + 9, 3):
-                    live.update(Group(*(Text("  ") + banner_line(line, sweep) for line in lines)))
-                    time.sleep(0.012)
-        for line in lines:
-            console.print(Text("  ") + banner_line(line))
-        console.print(Text.assemble(("  three minds", "#C9C8F5"), (" · ", MUTED), ("one answer", "#C9C8F5"),
-                                    ("   claude leads · gemini and codex advise", MUTED)))
+            self.boot()
+        wide = console.size.width >= len(BANNER[0]) + 8
+        lines = BANNER if wide else ("C O N C L A V E",)
+        for row, line in enumerate(lines):
+            console.print(Text("  ") + banner_line(line, row=row))
+        console.print(Text.assemble(("  SP_SYS", f"bold {ACCENT}"), (" // ", MUTED), ("COUNCIL OS", FG), ("   ", ""),
+                                    (f"{len(self.advisers) + 1} minds · one answer · claude leads", MUTED)))
         console.print()
         if animate:
             with Live(self.welcome_panel(0), console=console, refresh_per_second=30, transient=True) as live:
@@ -1842,12 +2114,13 @@ class Session:
         if here:
             console.print(Text.assemble(
                 ("  ❝ ", f"bold {ACCENT}"),
-                (f"This folder has {len(here)} Claude Code conversation{'s' if len(here) != 1 else ''}. ", "#C9C8F5"),
+                (f"This folder has {len(here)} Claude Code conversation{'s' if len(here) != 1 else ''}. ", SOFT),
                 ("/convos", f"bold {ACCENT}"), (" lists them · ", MUTED),
                 ("/attach latest", f"bold {ACCENT}"), (" brings the newest to the council", MUTED),
             ))
         console.print(Text.assemble(
             ("  Ask anything. ", MUTED),
+            ("@chatgpt", f"bold {ACCENT}"), (" hands a task to one agent · ", MUTED),
             ("/", f"bold {ACCENT}"), (" for commands · ", MUTED),
             ("alt+enter", f"bold {ACCENT}"), (" new line · ", MUTED),
             ("ctrl+c", f"bold {ACCENT}"), (" cancels a run · ", MUTED),
@@ -1859,7 +2132,7 @@ class Session:
         table = Table.grid(padding=(0, 3))
         for command, meaning in COMMANDS:
             table.add_row(Text(command, style=f"bold {ACCENT}"), Text(meaning, style=MUTED))
-        console.print(Panel(table, title=gradient(" COMMANDS "), title_align="left", box=box.ROUNDED,
+        console.print(Panel(table, title=label("Commands"), title_align="left", box=BRACKETS,
                             border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
     def themes(self) -> None:
@@ -1870,8 +2143,8 @@ class Session:
                 swatch.append(" ", style=f"on {shade(i, 24, palette=theme['gradient'])}")
             marker = Text("●", style=f"bold {theme['accent']}") if name == THEME else Text(" ")
             table.add_row(marker, Text(name, style=f"bold {theme['accent']}"), swatch)
-        console.print(Panel(table, title=gradient(" THEMES "), title_align="left", subtitle=Text(" /theme <name> ", style=MUTED),
-                            subtitle_align="right", box=box.ROUNDED, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
+        console.print(Panel(table, title=label("Themes", "each from one of your projects"), title_align="left", subtitle=Text(" /theme <name> ", style=MUTED),
+                            subtitle_align="right", box=BRACKETS, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
     def stats(self) -> None:
         table = Table.grid(padding=(0, 3))
@@ -1881,19 +2154,22 @@ class Session:
         table.add_row(Text("tokens", style=MUTED),
                       Text(f"↑{count(sum(r.tokens_in for r in self.rounds))} in · ↓{count(sum(r.tokens_out for r in self.rounds))} out"))
         cost = sum(r.cost for r in self.rounds)
-        table.add_row(Text("cost", style=MUTED), Text(f"≈${cost:.2f} (Claude's estimate; Gemini and Codex don't report cost)"))
+        table.add_row(Text("cost", style=MUTED), Text(f"≈${cost:.2f} (Claude's estimate; the other agents don't report cost)"))
         verdicts = [r for r in self.rounds if r.agreement]
         if verdicts:
             tally = {level: sum(r.agreement == level for r in verdicts) for level in ("strong", "partial", "split")}
             table.add_row(Text("agreement", style=MUTED), Text(" · ".join(f"{n} {level}" for level, n in tally.items() if n)))
-        console.print(Panel(table, title=gradient(" SESSION "), title_align="left", box=box.ROUNDED,
+        console.print(Panel(table, title=label("Session"), title_align="left", box=BRACKETS,
                             border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
     def toolbar(self):
         tokens = sum(r.tokens_in + r.tokens_out for r in self.rounds)
         parts = [("class:bar", " ")]
-        for name in ("claude", *self.advisers):
-            parts += [(f"class:{name}", f"{LABELS[name].split()[0]} {self.selected.get(name) or 'default'}"), ("class:bar", "   ")]
+        if self.target:
+            parts += [(f"class:{self.target}", f"→ {AGENTS[self.target].name} · {model_for(self.target, self.selected)}"),
+                      ("class:bar", "   ")]
+        for name in () if self.target else ("claude", *self.advisers):
+            parts += [(f"class:{name}", f"{LABELS[name].split()[0]} {model_for(name, self.selected)}"), ("class:bar", "   ")]
         if self.project or self.conversation:
             parts += [("class:sep", "│  "), ("class:project", f"⌂ {(self.project or Path.cwd()).name}   ")]
         if self.conversation:
@@ -1904,6 +2180,7 @@ class Session:
             ("class:bar", "saving sessions   " if self.save_sessions else "private   "),
             ("class:bar", "cross-exam   " if self.cross_examine else "quick   "),
             ("class:bar", f"split {self.split}   "),
+            (f"class:access-{self.access}", f"access {self.access}   "),
             ("class:sep", "│  "),
             ("class:bar", f"Σ {count(tokens)} tok · {plural(len(self.rounds), 'round')} "),
         ]
@@ -1938,17 +2215,89 @@ class Session:
                 Group(
                     Text.assemble((agent.label, f"bold {COLORS[agent.id]}"), ("   " + agent.name, MUTED),
                                   ("   lead" if agent.id == "claude" else "   seated" if seated else "", f"bold {ACCENT}")),
-                    Text(agent.strengths, style="#C9C8F5"),
+                    Text(agent.strengths, style=SOFT),
                     Text("● installed" if installed else f"✗ {agent.install}", style=GOOD if installed else MUTED),
                 ),
             )
-        console.print(Panel(table, title=gradient(" AGENTS "), title_align="left",
+        console.print(Panel(table, title=label("Agents"), title_align="left",
                             subtitle=Text(" /agents add <id> · /agents remove <id> · custom ones go in [agents] in the config ",
-                                          style=MUTED), subtitle_align="right", box=box.ROUNDED, border_style=EDGE,
+                                          style=MUTED), subtitle_align="right", box=BRACKETS, border_style=EDGE,
                             style=f"on {INK}", padding=(1, 2)))
 
     def note(self, message: str) -> None:
         console.print(f"  [{ACCENT}]›[/] [dim]{message}[/]")
+
+    def agent_named(self, word: str) -> str | None:
+        """The agent id for what was typed after @ or /to (claude, gemini, chatgpt, codex, qwen...), else None."""
+        word = word.lower().lstrip("@")
+        agent = ALIASES.get(word, word)
+        return agent if agent in AGENTS or agent == "council" else None
+
+    def hand_off(self, line: str) -> None:
+        """@agent task hands the task to one agent; @agent alone sends everything to it until /to council."""
+        first, _, rest = line.partition(" ")
+        agent = self.agent_named(first)
+        if not agent:
+            console.print(f"  [{BAD}]No agent called {first.lstrip('@')}.[/] Try @"
+                          + ", @".join(handle(a) for a in AGENTS) + " or @council.")
+        elif not rest.strip():
+            self.set_target(agent)
+        elif agent == "council":
+            self.council_once(rest.strip())
+        else:
+            self.ask(rest.strip(), agent=agent)
+
+    def council_once(self, request: str) -> None:
+        target, self.target = self.target, None
+        try:
+            self.ask(request)
+        finally:
+            self.target = target
+
+    def set_target(self, agent: str) -> None:
+        if agent == "council":
+            self.target = None
+            self.note("Your messages go to the whole council again.")
+            return
+        self.target = agent
+        if not shutil.which(AGENTS[agent].binary):
+            self.note(f"{AGENTS[agent].name} isn't installed yet: {AGENTS[agent].install} (or /setup).")
+        self.note(f"Talking to {AGENTS[agent].name} only, at {self.access} access: it keeps one conversation going, "
+                  f"like its own tool. /access edit lets it change files · @council asks everyone once · /to council goes back.")
+
+    def set_access(self, level: str) -> None:
+        if level == "full":
+            from prompt_toolkit.shortcuts import confirm
+
+            console.print(Text.assemble(
+                ("  Full access ", f"bold {BAD}"),
+                ("lets agents run any command on this computer without asking you first: install things, delete "
+                 "files, use your signed-in tools. They're told to ask before anything irreversible, but nothing "
+                 "enforces that. Use it in a project you've committed, for tasks you'd trust them with.", SOFT)))
+            try:
+                if not confirm("Give hand-offs full access?"):
+                    self.note(f"Access stays {self.access}.")
+                    return
+            except (KeyboardInterrupt, EOFError):
+                self.note(f"Access stays {self.access}.")
+                return
+        self.access = level
+        self.note(f"Hand-offs now run at {level} access: {ACCESS_NOTES[level]}. The council itself always only reads.")
+
+    def apply(self, rest: list[str]) -> None:
+        """Have an agent carry out the last verdict (or answer) in the project, at edit access or more."""
+        last = next((r for r in reversed(self.rounds) if r.final), None)
+        agent = self.agent_named(rest[0]) if rest else "claude"
+        if not last:
+            self.note("There's no verdict to apply yet.")
+            return
+        if not agent or agent == "council":
+            console.print(f"  [{BAD}]Usage:[/] /apply [agent]   (for example /apply, /apply chatgpt)")
+            return
+        access = self.access if self.access != "read" else "edit"
+        task = apply_task(last.request, last.final)
+        self.note(f"{AGENTS[agent].name} applies the verdict at {access} access in {home(self.project or Path.cwd())}.")
+        self.ask(f"Apply: {last.request}", agent=agent, access=access, task=task)
 
     def transcript(self) -> str:
         lines = [f"# Conclave session · {datetime.now():%Y-%m-%d %H:%M}", ""]
@@ -1981,7 +2330,8 @@ class Session:
             self.welcome()
         elif name == "/new":
             self.history.clear()
-            self.note("Started fresh. Earlier answers are forgotten.")
+            self.threads.clear()
+            self.note("Started fresh. Earlier answers are forgotten, and hand-offs start new conversations.")
         elif name == "/continue":
             provider = ALIASES.get(rest[0].lower(), rest[0].lower()) if rest else ""
             if provider not in AGENTS:
@@ -1993,6 +2343,24 @@ class Session:
                 self.note(f"Opening {SESSION_NAMES[provider]}. Exit it to come back to Conclave.")
                 subprocess.run(last.sessions[provider], shell=True)
                 console.print()
+        elif name in ("/ask", "/to"):
+            if not rest or not self.agent_named(rest[0]) or (name == "/ask" and len(rest) < 2):
+                usage = "/ask <agent> <task>" if name == "/ask" else "/to <agent|council>"
+                console.print(f"  [{BAD}]Usage:[/] {usage}   agents: {', '.join(handle(a) for a in AGENTS)}")
+            elif name == "/to":
+                self.set_target(self.agent_named(rest[0]))
+            else:
+                self.hand_off("@" + " ".join(rest))
+        elif name == "/access":
+            if not rest:
+                self.note(f"Hand-offs run at {self.access} access: {ACCESS_NOTES[self.access]}. "
+                          "/access read, /access edit or /access full changes it.")
+            elif rest[0].lower() not in ACCESS_LEVELS:
+                console.print(f"  [{BAD}]Usage:[/] /access <read|edit|full>")
+            else:
+                self.set_access(rest[0].lower())
+        elif name == "/apply":
+            self.apply(rest)
         elif name == "/setup":
             setup(ask_first=True, members=("claude", *self.advisers))
             if self.prompt is not None:
@@ -2015,8 +2383,8 @@ class Session:
                       "Quick rounds: no cross-examination, so verdicts come sooner.")
         elif name == "/private":
             self.save_sessions = not self.save_sessions
-            self.note("Rounds are saved as sessions in Claude Code, Gemini CLI and Codex." if self.save_sessions else
-                      "Rounds are private: Claude and Codex keep no session (Gemini CLI always keeps its own history).")
+            self.note("Rounds are saved as sessions in Claude Code, Gemini CLI and Codex (ChatGPT)." if self.save_sessions else
+                      "Rounds are private: Claude and ChatGPT keep no session (Gemini CLI always keeps its own history).")
         elif name == "/opinions":
             self.show_opinions = not self.show_opinions
             self.note(f"Adviser opinions will be {'shown' if self.show_opinions else 'hidden'}.")
@@ -2054,7 +2422,7 @@ class Session:
                     title = {"brief": "✦ CLAUDE · " + ("PLAN" if last.mode == "split" else "BRIEF"),
                              "verdict": "✦ VERDICT"}.get(what, f"{LABELS.get(what, '')} · {kind}")
                     console.print(Panel(Markdown(body), title=Text(f" {title} ", style=f"bold {color}"), title_align="left",
-                                        box=box.ROUNDED, border_style=blend(EDGE, color, 0.6), style=f"on {INK}", padding=(1, 3)))
+                                        box=BRACKETS, border_style=blend(EDGE, color, 0.6), style=f"on {INK}", padding=(1, 3)))
         elif name == "/retry":
             if not last:
                 self.note("Nothing to retry yet.")
@@ -2062,17 +2430,20 @@ class Session:
                 if self.history and self.history[-1][0] == last.request:
                     self.history.pop()
                 self.note(f"Asking again: {excerpt(last.request, 80)}")
-                self.ask(last.request)
+                if last.mode == "solo":
+                    self.ask(last.request, agent=last.speaker, access=last.access)
+                else:
+                    self.council_once(last.request)
         elif name == "/theme":
             if not rest:
                 self.themes()
-            elif rest[0].lower() not in THEMES:
+            elif THEME_ALIASES.get(rest[0].lower(), rest[0].lower()) not in THEMES:
                 console.print(f"  [{BAD}]Unknown theme {rest[0]}.[/] Choose from {', '.join(THEMES)}.")
             else:
                 apply_theme(rest[0].lower())
                 if self.prompt is not None:
                     self.prompt.style = prompt_style()
-                console.print(Text("  ") + gradient(f"Theme: {THEME}"))
+                console.print(Text("  ") + label("Theme", THEME))
         elif name == "/stats":
             self.stats()
         elif name == "/convos":
@@ -2083,8 +2454,9 @@ class Session:
                 console.print(f"  [{BAD}]No matching conversation.[/] /convos lists them; attach by number, latest or session id.")
             else:
                 self.conversation = found
-                if found.project and Path(found.project).is_dir():
+                if found.project and Path(found.project).is_dir() and Path(found.project) != self.project:
                     self.project = Path(found.project)
+                    self.threads.clear()  # an agent's session belongs to the folder it ran in
                 self.note(f"Attached “{excerpt(found.title, 70)}” ({found.messages} messages, {plural(found.errors, 'error')}, {found.when}). "
                           "Each question now includes it.")
         elif name == "/detach":
@@ -2095,12 +2467,15 @@ class Session:
                 self.note(f"Project: {home(self.project) if self.project else 'none (models run in ' + home(Path.cwd()) + ')'}")
             elif rest[0].lower() == "none":
                 self.project = self.conversation = None
+                self.threads.clear()
                 self.note("No project. The models run in the current folder without its git state.")
             else:
                 folder = Path(" ".join(rest)).expanduser().resolve()
                 if not folder.is_dir():
                     console.print(f"  [{BAD}]No such folder:[/] {folder}")
                 else:
+                    if folder != self.project:
+                        self.threads.clear()
                     self.project = folder
                     if self.conversation and Path(self.conversation.project or "").resolve() != folder:
                         self.conversation = None
@@ -2133,15 +2508,15 @@ class Session:
             attached = self.conversation and self.conversation.id == item.id
             table.add_row(
                 Text(f"{number:>2}", style=f"bold {ACCENT}" if attached else MUTED),
-                Text(excerpt(item.title, 64), style=f"bold {ACCENT}" if attached else "#E8E8F5"),
+                Text(excerpt(item.title, 64), style=f"bold {ACCENT}" if attached else FG),
                 Text(item.when, style=MUTED),
                 Text(f"{item.messages} msgs", style=MUTED),
                 Text(plural(item.errors, "error"), style=BAD if item.errors else MUTED),
                 Text(item.id[:8], style=blend(MUTED, INK, 0.3)),
             )
-        console.print(Panel(table, title=gradient(" CLAUDE CODE CONVERSATIONS "), title_align="left",
+        console.print(Panel(table, title=label("Claude Code conversations"), title_align="left",
                             subtitle=Text(f" {home(self.project or Path.cwd())} · /attach <n> ", style=MUTED),
-                            subtitle_align="right", box=box.ROUNDED, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
+                            subtitle_align="right", box=BRACKETS, border_style=EDGE, style=f"on {INK}", padding=(1, 2)))
 
     def shell(self, command: str) -> None:
         """Run a shell command here. `cd` moves Conclave itself, since a child shell's cd wouldn't last."""
@@ -2153,6 +2528,8 @@ class Session:
                 console.print(f"  [{BAD}]No such folder:[/] {folder}")
                 return
             os.chdir(folder.resolve())
+            if not self.project:
+                self.threads.clear()  # hand-offs ran in the old folder, and their sessions belong to it
             found = conclave_context.conversations(Path.cwd(), limit=200)
             self.note(f"Now in {home(Path.cwd())}" + (f": {plural(len(found), 'Claude Code conversation')} here, "
                                                        "/convos lists them" if found else ""))
@@ -2161,22 +2538,34 @@ class Session:
         if code:
             self.note(f"exited with status {code}")
 
-    def ask(self, request: str) -> None:
-        task = compose(request, self.project, self.conversation, self.history)
+    def ask(self, request: str, agent: str | None = None, access: str | None = None, task: str = "") -> None:
+        """Put a request to the council, or with `agent` (or a /to target) hand it straight to that agent. A
+        hand-off carries on the agent's own session from earlier hand-offs, so it remembers the work so far."""
+        agent = agent or self.target
+        access = access or (self.access if agent else "read")
+        resume = self.threads.get(agent, "") if agent else ""
+        if not task:
+            # An agent carrying on its own session already has the conversation and earlier answers.
+            task = request if resume else compose(request, self.project, self.conversation, self.history)
         console.print()
         try:
             result = council(task, request, self.selected, self.timeout, cwd=self.project, save_sessions=self.save_sessions,
-                             cross_examine=self.cross_examine, advisers=self.advisers, split=self.split)
+                             cross_examine=self.cross_examine, advisers=self.advisers, split=self.split,
+                             agent=agent, access=access, resume=resume)
         except KeyboardInterrupt:
             console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
             return
+        if agent and result.thread:
+            self.threads[agent] = result.thread
         self.rounds.append(result)
         self.last_report = write_report(result, self.show_opinions, None) or self.last_report
         show_sessions(result, interactive=True)
         if result.final:
             self.history.append((request, result.final))
             if not self.show_opinions and result.opinions:
-                self.note("/show gemini or /show codex for the full opinions")
+                self.note(f"/show {handle(self.advisers[0])} and the like print the full opinions")
+            elif result.mode != "solo" and any(word in result.final.lower() for word in ("fix", "change", "edit", "patch")):
+                self.note("/apply has Claude make these changes in the project (/apply chatgpt for another agent)")
         if result.seconds > 20:
             sys.stdout.write("\a")  # ring the terminal bell so a long run is noticed
             sys.stdout.flush()
@@ -2186,7 +2575,7 @@ def prompt_style():
     from prompt_toolkit.styles import Style
 
     return Style.from_dict({
-        "brand": f"bg:{ACCENT} {INK} bold",
+        "brand": f"bg:{ACCENT} #000000 bold",
         "arrow": f"{ACCENT} bold",
         "continuation": EDGE,
         "auto-suggestion": f"{blend(MUTED, INK, 0.3)} italic",
@@ -2194,8 +2583,12 @@ def prompt_style():
         "bar": MUTED,
         "sep": EDGE,
         "project": f"bold {ACCENT}",
+        "access-read": MUTED,
+        "access-edit": f"bold {WARN}",
+        "access-full": f"bold {BAD}",
+        **{f"to-{name}": f"bg:{agent_style(name)[0]} {agent_style(name)[2]} bold" for name in AGENTS},
         **{name: f"bold {COLORS[name]}" for name in PROVIDERS},
-        "completion-menu.completion": f"bg:{blend(INK, EDGE, 0.5)} #C9C8F5",
+        "completion-menu.completion": f"bg:{blend(INK, EDGE, 0.5)} {SOFT}",
         "completion-menu.completion.current": f"bg:{ACCENT} {INK} bold",
         "completion-menu.meta.completion": f"bg:{blend(INK, EDGE, 0.5)} {MUTED}",
         "completion-menu.meta.completion.current": f"bg:{blend(ACCENT, INK, 0.25)} {INK}",
@@ -2212,9 +2605,9 @@ def prompt_session(session: Session):
     from prompt_toolkit.key_binding import KeyBindings
 
     def arguments() -> dict[str, list[tuple[str, str]]]:
-        seated = [(a, AGENTS[a].name) for a in session.advisers]
+        seated = [(handle(a), AGENTS[a].name) for a in session.advisers]
         return {
-            "/model": [(a, AGENTS[a].name) for a in AGENTS],
+            "/model": [(handle(a), AGENTS[a].name) for a in AGENTS],
             "/show": [*seated, ("brief", "Claude's brief or plan"), ("verdict", "the last verdict")],
             "/continue": [("claude", "Claude Code"), *seated],
             "/agents": [("add", "seat an adviser"), ("remove", "unseat an adviser")],
@@ -2222,11 +2615,22 @@ def prompt_session(session: Session):
             "/theme": [(name, "") for name in THEMES],
             "/attach": [("latest", "the newest conversation for this project")],
             "/project": [("none", "stop reviewing a project")],
+            "/to": [(handle(a), AGENTS[a].name) for a in AGENTS] + [("council", "the whole council")],
+            "/ask": [(handle(a), AGENTS[a].name) for a in AGENTS],
+            "/apply": [(handle(a), AGENTS[a].name) for a in AGENTS],
+            "/access": [(level, ACCESS_NOTES[level]) for level in ACCESS_LEVELS],
         }
 
     class SlashCompleter(Completer):
         def get_completions(self, document, complete_event):
             text = document.text_before_cursor
+            if text.startswith("@") and " " not in text:
+                for agent in (*AGENTS, "council"):
+                    word = handle(agent)
+                    if word.startswith(text[1:].lower()):
+                        yield Completion("@" + word, start_position=-len(text),
+                                         display_meta=AGENTS[agent].name if agent in AGENTS else "the whole council")
+                return
             if not text.startswith("/") or "\n" in text:
                 return
             words = text.split(" ")
@@ -2268,7 +2672,10 @@ def prompt_session(session: Session):
     except OSError:
         history = InMemoryHistory()
     return PromptSession(
-        message=lambda: [("class:brand", " ✦ conclave "), ("class:arrow", " ❯ ")],
+        message=lambda: [("class:brand", " ■ CONCLAVE "),
+                         *([(f"class:to-{session.target}", f" → {handle(session.target).upper()} ")] if session.target else []),
+                         *([(f"class:access-{session.access}", f" {session.access.upper()}")] if session.access != "read" else []),
+                         ("class:arrow", " ❯ ")],
         multiline=True,
         key_bindings=keys,
         prompt_continuation=lambda width, _line, _wrap: [("class:continuation", " " * max(width - 2, 0) + "┊ ")],
@@ -2292,7 +2699,7 @@ def home(path: Path) -> str:
 def confirm_shell(line: str) -> bool:
     from prompt_toolkit.shortcuts import confirm
 
-    console.print(Text.assemble(("  ", ""), ("That looks like a shell command. ", "#C9C8F5"),
+    console.print(Text.assemble(("  ", ""), ("That looks like a shell command. ", SOFT),
                                 ("y", f"bold {ACCENT}"), (" runs it here, ", MUTED), ("n", f"bold {ACCENT}"),
                                 (" asks the council. (Start a line with ! to always run it.)", MUTED)))
     try:
@@ -2304,8 +2711,9 @@ def confirm_shell(line: str) -> bool:
 def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bool,
                 project: Path | None = None, conversation=None, save_sessions: bool = True,
                 cross_examine: bool = True, advisers: tuple[str, ...] = conclave_agents.DEFAULT_ADVISERS,
-                split: str = "auto") -> int:
+                split: str = "auto", agent: str | None = None, access: str = "read") -> int:
     session = Session(selected, timeout, show_opinions)
+    session.target, session.access = agent, access
     session.save_sessions = save_sessions
     session.cross_examine = cross_examine
     session.advisers, session.split = tuple(advisers), split
@@ -2327,6 +2735,9 @@ def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bo
                 break
         elif line.startswith("!"):
             session.shell(line[1:].strip())
+        elif line.startswith("@"):
+            session.hand_off(line)
+            console.print()
         elif looks_like_shell(line) and confirm_shell(line):
             session.shell(line)
         else:
@@ -2351,11 +2762,12 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="config TOML path")
     parser.add_argument("--claude-model", help="Claude model or alias for both lead stages")
     parser.add_argument("--gemini-model", help="Gemini model for the adviser")
-    parser.add_argument("--openai-model", help="Codex/OpenAI model for the adviser")
+    parser.add_argument("--openai-model", "--chatgpt-model", dest="openai_model", help="ChatGPT model (run through the Codex CLI)")
     parser.add_argument("--timeout", type=int, default=300, help="seconds allowed per model call (default: 300)")
     parser.add_argument("-o", "--output", type=Path, help="also save the answer as Markdown to this file")
     parser.add_argument("--show-opinions", action="store_true", help="print the advisers' full opinions after the answer")
-    parser.add_argument("--theme", choices=sorted(THEMES), help="colour theme (default: violet)")
+    parser.add_argument("--theme", choices=sorted([*THEMES, *THEME_ALIASES]),
+                        help="colour theme, each from one of your projects (default: sys)")
     parser.add_argument("-p", "--project", type=Path, help="project folder the models work in and review (its git state is included)")
     parser.add_argument("-c", "--conversation", metavar="N|latest|ID",
                         help="bring a Claude Code conversation for the project: its number in --list-conversations, latest, or session id")
@@ -2364,12 +2776,16 @@ def main() -> int:
                         help="comma-separated advisers to seat, e.g. gemini,codex,qwen (see /agents; default from the config)")
     parser.add_argument("--split", choices=("auto", "always", "never"),
                         help="whether Claude may split a big task into subtasks for the agents best suited (default: auto)")
+    parser.add_argument("--agent", "--to", dest="agent", metavar="AGENT",
+                        help="hand the task straight to one agent instead of the council, e.g. claude, gemini or chatgpt")
+    parser.add_argument("--access", choices=ACCESS_LEVELS, default="read",
+                        help="what a hand-off (--agent) may do: read only (default), edit the project, or full terminal access")
     parser.add_argument("--quick", action="store_true",
                         help="skip the cross-examination round, where advisers critique each other (see [council] in the config)")
     parser.add_argument("--setup", action="store_true",
-                        help="check that Claude, Gemini and Codex are installed and signed in, and offer to fix any that aren't")
+                        help="check that Claude, Gemini and ChatGPT (Codex CLI) are installed and signed in, and offer to fix any that aren't")
     parser.add_argument("--private", action="store_true",
-                        help="don't save this run as sessions in Claude Code, Gemini CLI and Codex (see [sessions] in the config)")
+                        help="don't save this run as sessions in Claude Code, Gemini CLI and Codex (ChatGPT) (see [sessions] in the config)")
     parser.add_argument("--handoff", action="store_true", help="after the verdict, save it and print the command that gives it back to Claude Code")
     parser.add_argument("--app", action="store_true", help="open the Conclave app in your browser")
     parser.add_argument("--install-app", action="store_true",
@@ -2381,9 +2797,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be at least 1")
+    if args.agent:
+        agent = ALIASES.get(args.agent.lower(), args.agent.lower())
+        if agent not in AGENTS:
+            parser.error(f"--agent takes one of: {', '.join(handle(a) for a in AGENTS)}")
+        args.agent = agent
+    elif args.access != "read":
+        parser.error("--access applies to hand-offs: add --agent (for example --agent claude --access edit)")
     if args.setup:
         try:
-            apply_theme(load_config(args.config).theme or "violet")
+            apply_theme(load_config(args.config).theme or DEFAULT_THEME)
         except ValueError:
             pass
         try:
@@ -2445,13 +2868,13 @@ def main() -> int:
         unknown = [a for a in args.advisers if a not in AGENTS or a == "claude"]
         if unknown or not args.advisers:
             parser.error(f"--advisers takes agents from: {', '.join(a for a in AGENTS if a != 'claude')}")
-    apply_theme(args.theme or settings.theme or "violet")
+    apply_theme(args.theme or settings.theme or DEFAULT_THEME)
     selected = {name: models.get(name) for name in AGENTS}
     selected.update({name: value for name, value in (("claude", args.claude_model), ("gemini", args.gemini_model),
                                                       ("openai", args.openai_model)) if value})
     if session:
         return interactive(selected, args.timeout, args.show_opinions, project, conversation, args.save_sessions,
-                           args.cross_examine, args.advisers, args.split)
+                           args.cross_examine, args.advisers, args.split, args.agent, args.access)
     return run(args, selected, project, conversation)
 
 

@@ -299,7 +299,7 @@ def handoff(project: Path, conversation: Conversation | None, verdict: str) -> t
         ignore.write_text("*\n", encoding="utf-8")
     path = folder / f"verdict-{datetime.now():%Y%m%d-%H%M%S}.md"
     path.write_text(verdict.strip() + "\n", encoding="utf-8")
-    message = (f"Gemini and Codex reviewed this conversation in Conclave. Read .conclave/{path.name}, the verdict "
+    message = (f"The Conclave council (Gemini, ChatGPT and other agents) reviewed this conversation. Read .conclave/{path.name}, the verdict "
                "of the council, say where you agree or disagree, then apply the fixes you agree with.")
     resume = f"--resume {conversation.id} " if conversation else ""
     command = f"cd {quote(str(project))} && claude {resume}{quote(message)}"

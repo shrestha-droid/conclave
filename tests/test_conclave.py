@@ -61,7 +61,7 @@ def emit(event):
     print(json.dumps(event), flush=True)
 
 def say(text):
-    emit({"type": "system", "subtype": "init"})
+    emit({"type": "system", "subtype": "init", "model": "claude-test-model"})
     emit({"type": "stream_event", "parent_tool_use_id": None, "event": {"type": "message_start", "message": {}}})
     emit({"type": "stream_event", "parent_tool_use_id": None,
           "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "name": "Read"}}})
@@ -73,7 +73,9 @@ def say(text):
 
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("claude " + os.getcwd() + "\\n")
-if "Your advisers:" in prompt and os.environ.get("FAKE_PLAN"):
+if "Carry out this plan" in prompt:
+    say("APPLIED THE PLAN")
+elif "Your advisers:" in prompt and os.environ.get("FAKE_PLAN"):
     say(json.dumps({"plan": [{"agent": "gemini", "title": "Map the schema", "instructions": "List the tables"},
                              {"agent": "codex", "title": "Run the tests", "instructions": "Run pytest"},
                              {"agent": "nobody", "title": "Check the docs", "instructions": "Read the README"}]}))
@@ -99,7 +101,7 @@ if sys.argv[1:2] == ["--version"]:
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["gemini", *sys.argv[1:]]) + "\\n")
-assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt
+assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt or "user's request below" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("gemini " + os.getcwd() + "\\n")
 def emit(event):
@@ -126,7 +128,7 @@ if sys.argv[1:3] == ["login", "status"]:
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["codex", *sys.argv[1:]]) + "\\n")
-assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt
+assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt or "user's request below" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("codex " + os.getcwd() + "\\n")
 def emit(event):
@@ -367,7 +369,7 @@ def test_rounds_are_saved_as_sessions_in_each_tool(fake_bin, tmp_path):
     stderr = re.sub(r"\s+", " ", result.stderr)
     assert f"continue in Claude Code: cd {tmp_path} && claude --resume {lead}" in stderr
     assert f"continue in Gemini CLI: cd {tmp_path} && gemini --resume {gemini}" in stderr
-    assert f"continue in Codex: cd {tmp_path} && codex resume codex-thread-1" in stderr
+    assert f"continue in ChatGPT: cd {tmp_path} && codex resume codex-thread-1" in stderr
 
 
 def test_private_runs_leave_no_sessions(fake_bin, tmp_path):
@@ -639,6 +641,72 @@ def test_unknown_conversation_is_a_usage_error(fake_bin, tmp_path):
     assert result.returncode == 2 and "no Claude Code conversation" in result.stderr
 
 
+def test_hand_off_to_one_agent(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "--agent", "gemini", "--access", "edit", "Fix the login bug", tmp_path=tmp_path,
+                     ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "GEMINI SAYS go\n"
+    calls = argv_log(log)
+    assert list(calls) == ["gemini"]  # no council: Claude isn't asked for a brief or a verdict
+    argv = calls["gemini"][0]
+    assert argv[argv.index("--approval-mode") + 1] == "auto_edit"
+    assert "Gemini CLI · edit access" in re.sub(r"\s+", " ", result.stderr)
+    assert "continue in Gemini CLI" in result.stderr
+
+    result = run_cli(fake_bin, "--to", "chatgpt", "Explain the schema", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "CODEX SAYS go\n"
+    assert "read-only" in argv_log(log)["codex"][0]
+
+
+def test_access_needs_an_agent(fake_bin, tmp_path):
+    result = run_cli(fake_bin, "--access", "full", "Do everything", tmp_path=tmp_path)
+    assert result.returncode == 2 and "--agent" in result.stderr
+    result = run_cli(fake_bin, "--agent", "nobody", "Hi", tmp_path=tmp_path)
+    assert result.returncode == 2 and "chatgpt" in result.stderr
+
+
+def test_access_levels_and_resumed_sessions():
+    def argv(provider, access="read", session=None):
+        return conclave.command_for(provider, "hi", None, session=session, access=access)[0]
+
+    assert argv("claude")[argv("claude").index("--permission-mode") + 1] == "plan"
+    assert argv("claude", "edit")[argv("claude", "edit").index("--permission-mode") + 1] == "acceptEdits"
+    assert "--dangerously-skip-permissions" in argv("claude", "full")
+    assert [argv("gemini", level)[2] for level in conclave.ACCESS_LEVELS] == ["plan", "auto_edit", "yolo"]
+    assert "workspace-write" in argv("openai", "edit")
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv("openai", "full")
+    assert "--allow-all-tools" in argv("copilot", "full") and "--deny-tool=shell" in argv("copilot", "edit")
+    assert argv("opencode", "edit")[3] == "build"
+    resume = conclave.SessionPlan("s-1", resume=True)
+    assert argv("claude", "edit", resume)[-2:] == ["--resume", "s-1"]
+    assert argv("gemini", "edit", resume)[-2:] == ["--resume", "s-1"]
+    codex = argv("openai", "edit", resume)
+    assert codex[:3] == ["codex", "exec", "resume"] and codex[-2:] == ["s-1", "-"]
+    assert 'sandbox_mode="workspace-write"' in codex and "--sandbox" not in codex
+
+
+def test_models_are_shown_from_settings_and_streams(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(conclave, "SEEN_MODELS", {})
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text('model = "gpt-test"\n')
+    (tmp_path / ".gemini").mkdir()
+    (tmp_path / ".gemini" / "settings.json").write_text('{"model": {"name": "gemini-test-pro"}}')
+    assert conclave.model_for("openai", {}) == "gpt-test"
+    assert conclave.model_for("gemini", {}) == "gemini-test-pro"
+    assert conclave.model_for("claude", {}) == "default model"
+    assert conclave.model_for("claude", {"claude": "opus"}) == "opus"
+    stream = feed("claude", [{"type": "system", "subtype": "init", "model": "claude-reported"}])
+    assert stream.model == "claude-reported" and conclave.model_for("claude", {}) == "claude-reported"
+    feed("gemini", [{"type": "init", "model": "gemini-reported"}])
+    assert conclave.model_for("gemini", {}) == "gemini-reported"
+
+
 # ---------------------------------------------------------------- interactive session
 
 ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[()][0-9A-Za-z]|[=>78])")
@@ -647,8 +715,9 @@ ANSI = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[()][0-9A-Za-z]|[=
 class Terminal:
     """Drive conclave in a pseudo-terminal, the way a person would."""
 
-    def __init__(self, bin_dir: Path, tmp_path: Path, *args: str, cwd: Path | None = None):
-        env = env_for(bin_dir, tmp_path, COLUMNS="120", LINES="50", TERM="xterm-256color", CONCLAVE_NO_ANIMATION="1")
+    def __init__(self, bin_dir: Path, tmp_path: Path, *args: str, cwd: Path | None = None, **extra: str):
+        env = env_for(bin_dir, tmp_path, COLUMNS="120", LINES="50", TERM="xterm-256color", CONCLAVE_NO_ANIMATION="1",
+                      **extra)
         self.fd, child = pty.openpty()
         fcntl.ioctl(child, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 120, 0, 0))
         self.proc = subprocess.Popen(
@@ -694,14 +763,14 @@ def test_interactive_session(fake_bin, tmp_path):
     term.command("Pick a database", "FINAL ANSWER (saw gemini, saw codex, saw rebuttals)", "AGREEMENT")
     term.command("And for caching?", "saw history", "memory 2/3")
     term.command("/show gemini", "GEMINI SAYS go")
-    term.command("/continue codex", "Opening Codex", "RESUMED codex-thread-1")
+    term.command("/continue codex", "Opening ChatGPT", "RESUMED codex-thread-1")
     term.command("/private", "Rounds are private")
     term.command("/agents", "AGENTS", "Qwen Code", "Ollama")
     term.command("/agents add qwen", "Qwen Code now advises", "isn't installed yet")
     term.command("/agents remove qwen", "left the council")
     term.command("/split always", "splits every task")
     term.command("/model codex gpt-x", "now uses gpt-x")
-    term.command("/theme ember", "Theme: ember")
+    term.command("/theme ember", "THEME ] kakeya")
     term.command("/stats", "SESSION", "2 strong")
     term.command("/save answer.md", "Saved to answer.md")
     term.command("/export session.md", "Saved to session.md")
@@ -712,6 +781,31 @@ def test_interactive_session(fake_bin, tmp_path):
     assert "saw history" in (tmp_path / "answer.md").read_text()
     transcript = (tmp_path / "session.md").read_text()
     assert "## 1. Pick a database" in transcript and "## 2. And for caching?" in transcript
+
+
+@pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
+def test_interactive_hand_offs(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    term = Terminal(fake_bin, tmp_path, ARGV_LOG=str(log))
+    term.expect("memory 0/3")
+    term.command("@nobody hello", "No agent called nobody")
+    term.command("@gemini Read the schema", "GEMINI · ANSWER", "GEMINI SAYS go")
+    term.command("/access edit", "edit access")
+    term.command("/to claude", "Talking to Claude Code only")
+    term.expect("→ CLAUDE")  # the prompt says where messages go
+    term.command("Fix the login", "FINAL ANSWER")
+    term.command("And the tests?", "FINAL ANSWER", "claude-test-model")
+    term.command("@council Pick a database", "AGREEMENT")
+    term.command("/apply chatgpt", "applies the verdict", "CODEX SAYS go")
+    term.command("/to council", "whole council again")
+    term.send("/exit")
+    term.expect("adjourned")
+    calls = argv_log(log)
+    first, second = [argv for argv in calls["claude"] if "acceptEdits" in argv]
+    session = first[first.index("--session-id") + 1]
+    assert second[second.index("--resume") + 1] == session  # the follow-up carried on Claude's own session
+    assert any(argv[:2] == ["exec", "resume"] or "workspace-write" in argv for argv in calls["codex"])
+    assert calls["gemini"][0][calls["gemini"][0].index("--approval-mode") + 1] == "plan"
 
 
 @pytest.mark.skipif(not hasattr(pty, "openpty"), reason="needs a POSIX terminal")
@@ -839,6 +933,44 @@ def test_app_runs_a_split_round(app_server, monkeypatch):
     assert statuses.count("done") == 3
     result = seen[-1]["result"]
     assert result["mode"] == "split" and len(result["plan"]) == 3 and "saw subtasks" in result["final"]
+
+
+def test_app_hands_off_carries_on_and_applies(app_server, tmp_path, monkeypatch):
+    app, base = app_server
+    log = tmp_path / "argv.log"
+    monkeypatch.setenv("ARGV_LOG", str(log))
+    info = call(base, "/api/info", app.token)
+    chatgpt = next(a for a in info["agents"] if a["id"] == "openai")
+    assert chatgpt["name"] == "ChatGPT" and chatgpt["handle"] == "chatgpt" and chatgpt["style"]["c"] == "#10A37F"
+    assert set(info["access"]) == {"read", "edit", "full"}
+
+    run = call(base, "/api/runs", app.token, {"question": "Fix the login", "agent": "claude", "access": "edit"})
+    seen = events(base, run["id"], app.token)
+    assert seen[-1]["type"] == "done", seen[-1]
+    result = seen[-1]["result"]
+    assert (result["mode"], result["speaker"], result["access"]) == ("solo", "claude", "edit") and result["thread"]
+    assert any(e.get("model") == "claude-test-model" for e in seen if e["type"] == "stream")
+    follow = call(base, "/api/runs", app.token, {"question": "And the tests?", "agent": "claude", "access": "edit",
+                                                  "thread": result["thread"]})
+    assert events(base, follow["id"], app.token)[-1]["result"]["thread"] == result["thread"]
+
+    council = call(base, "/api/runs", app.token, {"question": "Pick a database"})
+    assert events(base, council["id"], app.token)[-1]["type"] == "done"
+    applied = call(base, "/api/runs", app.token, {"question": "Apply: Pick a database", "agent": "claude", "apply": council["id"]})
+    result = events(base, applied["id"], app.token)[-1]["result"]
+    assert result["final"] == "APPLIED THE PLAN" and result["access"] == "edit"  # applying never runs read-only
+
+    claude = argv_log(log)["claude"]
+    assert "acceptEdits" in claude[0] and claude[1][claude[1].index("--resume") + 1] == result_thread(claude[0])
+    for body in ({"question": "x", "agent": "nobody"}, {"question": "x", "agent": "claude", "access": "root"},
+                 {"question": "x", "apply": "missing"}):
+        with pytest.raises(HTTPError) as error:
+            call(base, "/api/runs", app.token, body)
+        assert error.value.code == 400
+
+
+def result_thread(argv: list[str]) -> str:
+    return argv[argv.index("--session-id") + 1]
 
 
 def test_app_rejects_bad_requests(app_server):

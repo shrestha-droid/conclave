@@ -57,11 +57,13 @@ _add(Agent(
     sprite="gemini", resume="gemini --resume {id}",
 ))
 _add(Agent(
-    "openai", "✳ OPENAI · CODEX", "Codex", "codex", "codex",
+    # ChatGPT has no command-line tool of its own; Codex is OpenAI's, signed in with your ChatGPT account and
+    # running ChatGPT's GPT models, so ChatGPT joins the council through it.
+    "openai", "✳ CHATGPT", "ChatGPT", "codex", "codex",
     "strong at code; can run read-only commands such as tests and searches in a sandbox to check claims",
-    "Install Codex CLI: npm install -g @openai/codex@latest",
+    "Install the Codex CLI, ChatGPT's coding agent: npm install -g @openai/codex@latest, then codex login",
     "npm install -g @openai/codex@latest",
-    "Sign in again: run `codex login` in your terminal, then retry.", "codex login",
+    "Sign in again: run `codex login` in your terminal and choose Sign in with ChatGPT, then retry.", "codex login",
     sprite="codex", resume="codex resume {id}",
 ))
 _add(Agent(
