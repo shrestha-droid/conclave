@@ -16,7 +16,9 @@ import sys
 import threading
 import time
 import tomllib
+import shlex
 import textwrap
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +36,7 @@ from rich.text import Text
 import conclave_context
 
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "conclave" / "config.toml"
 PROVIDERS = {
     "claude": "claude",
@@ -108,10 +110,17 @@ apply_theme("violet")
 
 # ---------------------------------------------------------------- config
 
-def load_config(path: Path) -> tuple[dict[str, str], str | None]:
-    """Read [models] and [ui] from the config file; returns the chosen models and theme."""
+@dataclass
+class Settings:
+    models: dict[str, str] = field(default_factory=dict)
+    theme: str | None = None
+    save_sessions: bool = True  # keep each round as a resumable session in Claude Code, Gemini CLI and Codex
+
+
+def load_config(path: Path) -> Settings:
+    """Read [models], [ui] and [sessions] from the config file."""
     if not path.exists():
-        return {}, None
+        return Settings()
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
@@ -134,35 +143,68 @@ def load_config(path: Path) -> tuple[dict[str, str], str | None]:
     theme = ui.get("theme")
     if theme is not None and theme not in THEMES:
         raise ValueError(f"Unknown theme {theme!r} in [ui] in {path}; choose from {', '.join(THEMES)}")
-    return selected, theme
+    sessions = data.get("sessions", {})
+    if not isinstance(sessions, dict) or not isinstance(sessions.get("save", True), bool):
+        raise ValueError(f"[sessions] in {path} must be a table with save = true or false")
+    return Settings(selected, theme, sessions.get("save", True))
 
 
 def load_models(path: Path) -> dict[str, str]:
-    return load_config(path)[0]
+    return load_config(path).models
 
 
 # ---------------------------------------------------------------- talking to the provider CLIs
 
-def command_for(provider: str, prompt: str, model: str | None, structured: bool = True) -> tuple[list[str], str | None]:
+@dataclass
+class SessionPlan:
+    """How a call is kept in the provider's own session history.
+
+    Claude: start session `id` named `name`, or with `resume` continue it. Gemini: record it as session `id`.
+    Codex: keep the session (Codex picks its own id; Stream reads it from the thread.started event).
+    """
+    id: str = ""
+    name: str = ""
+    resume: bool = False
+
+
+def command_for(provider: str, prompt: str, model: str | None, structured: bool = True,
+                session: SessionPlan | None = None) -> tuple[list[str], str | None]:
     """The command line for one provider. Structured output streams JSON events so the dashboard can show work as
-    it happens; plain output is the fallback when those events can't be read."""
+    it happens; plain output is the fallback when those events can't be read. Without a session plan the call
+    leaves no session behind where the CLI allows that."""
     if provider == "claude":
         output = ["stream-json", "--verbose", "--include-partial-messages"] if structured else ["text"]
-        cmd = ["claude", "-p", "--output-format", *output,
-               "--permission-mode", "plan", "--permission-prompts", "none", "--no-session-persistence"]
+        cmd = ["claude", "-p", "--output-format", *output, "--permission-mode", "plan", "--permission-prompts", "none"]
+        if session and session.resume:
+            cmd += ["--resume", session.id]
+        elif session:
+            cmd += ["--session-id", session.id, "--name", session.name]
+        else:
+            cmd += ["--no-session-persistence"]
         if model:
             cmd += ["--model", model]
         return cmd, prompt
     if provider == "gemini":
         # Piped stdin puts Gemini in headless mode and avoids argv length limits on long prompts.
         cmd = ["gemini", "--approval-mode", "plan", "--output-format", "stream-json" if structured else "text"]
+        if session:
+            cmd += ["--session-id", session.id]
         if model:
             cmd += ["--model", model]
         return cmd, prompt
-    cmd = ["codex", "exec", *(["--json"] if structured else []), "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral"]
+    cmd = ["codex", "exec", *(["--json"] if structured else []), "--sandbox", "read-only", "--skip-git-repo-check"]
+    if not session:
+        cmd += ["--ephemeral"]
     if model:
         cmd += ["--model", model]
     return cmd + ["-"], prompt
+
+
+def continue_command(provider: str, session_id: str, cwd: Path | str) -> str:
+    """The command that opens a saved Conclave session in the provider's own tool."""
+    resume = {"claude": f"claude --resume {session_id}", "gemini": f"gemini --resume {session_id}",
+              "openai": f"codex resume {session_id}"}[provider]
+    return f"cd {shlex.quote(str(cwd))} && {resume}"
 
 
 class EmptyAnswer(RuntimeError):
@@ -179,6 +221,7 @@ class Reply:
     tokens_in: int = 0
     tokens_out: int = 0
     cost: float = 0.0
+    session_id: str = ""  # the provider's own session id, when the call was saved
 
 
 def first_line(value: str, limit: int = 70) -> str:
@@ -207,6 +250,7 @@ class Stream:
         self.tokens_in = 0
         self.tokens_out = 0
         self.cost = 0.0
+        self.session_id = ""
 
     @property
     def live(self) -> str:
@@ -282,7 +326,9 @@ class Stream:
 
     def _codex(self, event: dict) -> None:
         kind = event.get("type")
-        if kind in ("item.started", "item.updated", "item.completed"):
+        if kind == "thread.started":
+            self.session_id = str(event.get("thread_id") or "")
+        elif kind in ("item.started", "item.updated", "item.completed"):
             item = event.get("item") or {}
             sort = item.get("type")
             if sort == "agent_message":
@@ -325,7 +371,7 @@ class Stream:
         answer = (self.final if self.final is not None else self.live).strip()
         if not answer:
             raise EmptyAnswer(f"{binary} returned an empty answer", structured=self.events > 0)
-        return Reply(answer, self.tokens_in, self.tokens_out, self.cost)
+        return Reply(answer, self.tokens_in, self.tokens_out, self.cost, self.session_id)
 
 
 def stop(proc: subprocess.Popen) -> None:
@@ -375,17 +421,17 @@ class Control:
 
 
 def ask(provider: str, prompt: str, model: str | None, timeout: int, watch=None,
-        cwd: Path | str | None = None, control: Control | None = None) -> Reply:
+        cwd: Path | str | None = None, control: Control | None = None, session: SessionPlan | None = None) -> Reply:
     """Run one provider CLI in `cwd`, calling watch(stream) as its output arrives, and return its Reply.
 
     If the CLI streams JSON that holds no answer Conclave can read (say its event format changed), it is asked once
-    more for plain text.
+    more for plain text (without saving a session, since the first attempt may already have claimed its id).
     """
     binary = PROVIDERS[provider]
     if not shutil.which(binary):
         raise RuntimeError(f"{binary} is not installed (not found on PATH).")
     try:
-        return call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=True)
+        return call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=True, session=session)
     except EmptyAnswer as exc:
         if not exc.structured:
             raise
@@ -393,15 +439,18 @@ def ask(provider: str, prompt: str, model: str | None, timeout: int, watch=None,
         fallback = Stream(provider)
         fallback.activity = "retrying with plain output"
         watch(fallback)
-    return call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=False)
+    reply = call_cli(provider, prompt, model, timeout, watch, cwd, control, structured=False)
+    reply.session_id = ""
+    return reply
 
 
-def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch, cwd, control, structured: bool) -> Reply:
+def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch, cwd, control, structured: bool,
+             session: SessionPlan | None = None) -> Reply:
     binary = PROVIDERS[provider]
     if control and control.cancelled.is_set():
         raise Cancelled()
 
-    command, stdin = command_for(provider, prompt, model, structured)
+    command, stdin = command_for(provider, prompt, model, structured, session)
     try:
         # A separate process group lets a timeout or Ctrl+C stop the CLI's child processes too.
         proc = subprocess.Popen(
@@ -467,7 +516,12 @@ def call_cli(provider: str, prompt: str, model: str | None, timeout: int, watch,
     if expired.is_set():
         raise RuntimeError(f"{binary} timed out after {timeout} seconds")
     helpers[1].join(timeout=2)
-    return stream.reply(binary, proc.returncode, "".join(errors))
+    reply = stream.reply(binary, proc.returncode, "".join(errors))
+    if not session:
+        reply.session_id = ""  # Codex reports a thread id even for an --ephemeral run, but nothing was saved
+    elif not reply.session_id and provider != "openai":
+        reply.session_id = session.id  # Claude and Gemini use the id Conclave chose; Codex reports its own
+    return reply
 
 
 # ---------------------------------------------------------------- look and feel
@@ -853,6 +907,7 @@ class Round:
     cost: float = 0.0
     seconds: float = 0.0
     errors: list[tuple[str, str, str]] = field(default_factory=list)  # (provider, headline, message)
+    sessions: dict[str, str] = field(default_factory=dict)  # provider -> command that continues its saved session
 
     def add(self, reply: Reply) -> None:
         self.tokens_in += reply.tokens_in
@@ -860,10 +915,31 @@ class Round:
         self.cost += reply.cost
 
 
-def read_task(words: list[str], stdin) -> str:
-    """Combine the task words with anything piped on stdin, e.g. `cat plan.md | conclave "Review this"`."""
+def piped_ready(stdin, wait: float) -> bool:
+    """Whether piped input arrives (or ends) within `wait` seconds."""
+    if os.name == "nt":
+        return True  # select() can't wait on pipes on Windows
+    try:
+        import select
+
+        return bool(select.select([stdin], [], [], wait)[0])
+    except (OSError, ValueError, TypeError):
+        return True
+
+
+def read_task(words: list[str], stdin, wait: float = 2.0) -> str:
+    """Combine the task words with anything piped on stdin, e.g. `cat plan.md | conclave "Review this"`.
+
+    When the task is already given as words, a stdin that stays silent (an open pipe nothing writes to, as some
+    tools and schedulers provide) is ignored after `wait` seconds instead of blocking forever.
+    """
     task = " ".join(words).strip()
-    piped = "" if stdin is None or stdin.isatty() else stdin.read().strip()
+    piped = ""
+    if stdin is not None and not stdin.isatty():
+        if not task or piped_ready(stdin, wait):
+            piped = stdin.read().strip()
+        else:
+            print("conclave: nothing arrived on stdin, so going ahead without it", file=sys.stderr)
     if task and piped:
         return f"{task}\n\n<input>\n{piped}\n</input>"
     return task or piped
@@ -894,17 +970,25 @@ def compose(request: str, project: Path | None = None, conversation=None, histor
 
 
 def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
-               cwd: Path | str | None = None, control: Control | None = None) -> Round:
+               cwd: Path | str | None = None, control: Control | None = None,
+               title: str = "", save_sessions: bool = False) -> Round:
     """Run one round: Claude briefs, the advisers answer in parallel, Claude writes the verdict.
 
     `view` receives progress (see Dashboard). Model failures are collected in Round.errors rather than raised;
-    Cancelled and KeyboardInterrupt propagate.
+    Cancelled and KeyboardInterrupt propagate. With save_sessions, Claude's brief and verdict share one named
+    Claude Code session and each adviser's call is kept in its own tool, so any of them can be continued there.
     """
     result = Round(task)
     started = time.monotonic()
+    folder = Path(cwd or Path.cwd())
+    lead = SessionPlan(str(uuid.uuid4()), f"Conclave · {excerpt(title or task, 70)}") if save_sessions else None
+    plans = {"gemini": SessionPlan(str(uuid.uuid4())), "openai": SessionPlan()} if save_sessions else {}
 
-    def call(name: str, prompt: str) -> Reply:
-        return ask(name, prompt, selected[name], timeout, view.watch(name), cwd=cwd, control=control)
+    def call(name: str, prompt: str, session: SessionPlan | None = None) -> Reply:
+        reply = ask(name, prompt, selected[name], timeout, view.watch(name), cwd=cwd, control=control, session=session)
+        if reply.session_id:
+            result.sessions[name] = continue_command(name, reply.session_id, folder)
+        return reply
 
     def tally(name: str, reply: Reply) -> None:
         view.tokens(name, reply.tokens_in, reply.tokens_out)
@@ -918,7 +1002,7 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
                          "You are the lead AI on this task. Prepare a concise review brief for two advisers. State the key "
                          "question they should answer and what evidence or tradeoffs to examine; when there is a project or "
                          f"conversation, point them at the files and errors that matter. Do not answer the task yet. {MATERIAL}\n\n"
-                         f"USER TASK:\n{task}")
+                         f"USER TASK:\n{task}", lead)
         except RuntimeError as exc:
             view.finish("claude", "error", "lead unavailable", excerpt(str(exc)))
             result.errors.append(("claude", "CLAUDE COULDN'T START THE REVIEW", str(exc)))
@@ -935,7 +1019,7 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
         )
         for name in ("gemini", "openai"):
             view.start(name, "forming an opinion")
-        jobs = {pool.submit(call, name, adviser_prompt): name for name in ("gemini", "openai")}
+        jobs = {pool.submit(call, name, adviser_prompt, plans.get(name)): name for name in ("gemini", "openai")}
         for job in concurrent.futures.as_completed(jobs):
             name = jobs[job]
             try:
@@ -963,14 +1047,18 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
             "End with one final line in exactly this form, and nothing after it:\n"
             "COUNCIL: agreement=<strong|partial|split>; confidence=<high|medium|low>\n"
             "where agreement is how far you and the advisers agree, and confidence is how sure you are of the answer.\n\n"
-            f"{note}{MATERIAL}\n\nUSER TASK:\n{task}\n\nYOUR REVIEW BRIEF:\n{result.brief}\n\n"
-            f"<gemini_opinion>\n{result.opinions['gemini']}\n</gemini_opinion>\n\n"
+            f"{note}{MATERIAL}\n\n"
+            # A resumed session already holds the task and the brief, so they aren't sent twice.
+            + ("The task and your brief are earlier in this conversation.\n\n" if "claude" in result.sessions
+               else f"USER TASK:\n{task}\n\nYOUR REVIEW BRIEF:\n{result.brief}\n\n")
+            + f"<gemini_opinion>\n{result.opinions['gemini']}\n</gemini_opinion>\n\n"
             f"<codex_opinion>\n{result.opinions['openai']}\n</codex_opinion>"
         )
         view.set_phase("verdict")
         view.start("claude", "writing the verdict")
         try:
-            reply = call("claude", final_prompt)
+            resume = SessionPlan(lead.id, resume=True) if lead and "claude" in result.sessions else None
+            reply = call("claude", final_prompt, resume)
         except RuntimeError as exc:
             view.finish("claude", "error", "verdict failed", excerpt(str(exc)))
             result.errors.append(("claude", "CLAUDE COULDN'T WRITE THE VERDICT", str(exc)))
@@ -987,13 +1075,14 @@ def deliberate(task: str, selected: dict[str, str | None], timeout: int, view,
     return result
 
 
-def council(task: str, title: str, selected: dict[str, str | None], timeout: int, cwd: Path | None = None) -> Round:
+def council(task: str, title: str, selected: dict[str, str | None], timeout: int, cwd: Path | None = None,
+            save_sessions: bool = False) -> Round:
     """A round in the terminal, with the live dashboard. On Ctrl+C the model calls are stopped and KeyboardInterrupt
     propagates."""
     board = Dashboard(selected, title)
     try:
         with Live(board, console=console, refresh_per_second=12):
-            result = deliberate(task, selected, timeout, board, cwd=cwd)
+            result = deliberate(task, selected, timeout, board, cwd=cwd, title=title, save_sessions=save_sessions)
     except KeyboardInterrupt:
         stop_all()
         raise
@@ -1061,6 +1150,29 @@ def write_report(result: Round, show_opinions: bool, output: Path | None) -> str
     return text
 
 
+SESSION_NAMES = {"claude": "Claude Code", "gemini": "Gemini CLI", "openai": "Codex"}
+
+
+def show_sessions(result: Round, interactive: bool = False) -> None:
+    """Where each model's part of the round was saved, and the command that continues it in that tool."""
+    if not result.sessions:
+        return
+    if not console.is_terminal:
+        for name in ("claude", "gemini", "openai"):
+            if name in result.sessions:
+                console.print(Text(f"↪ continue in {SESSION_NAMES[name]}: {result.sessions[name]}", style=MUTED), soft_wrap=True)
+        return
+    table = Table.grid(padding=(0, 2))
+    for name in ("claude", "gemini", "openai"):
+        if name in result.sessions:
+            table.add_row(Text(f"{LABELS[name].split()[0]} {SESSION_NAMES[name]}", style=f"bold {COLORS[name]}"),
+                          Text(result.sessions[name], style=MUTED))
+    hint = "/continue claude|gemini|codex opens one here" if interactive else "run one to keep talking to that model"
+    console.print(Panel(table, title=Text(" ↪ CONTINUE IN EACH MODEL'S OWN TOOL ", style=f"bold {ACCENT}"), title_align="left",
+                        subtitle=Text(f" {hint} ", style=MUTED), subtitle_align="right", box=box.ROUNDED,
+                        border_style=EDGE, style=f"on {INK}", padding=(0, 2)))
+
+
 def save(text: str, path: Path) -> None:
     try:
         path.expanduser().write_text(text + "\n", encoding="utf-8")
@@ -1072,11 +1184,13 @@ def save(text: str, path: Path) -> None:
 
 def run(args: argparse.Namespace, selected: dict[str, str | None], project: Path | None, conversation) -> int:
     try:
-        result = council(compose(args.task, project, conversation), args.task, selected, args.timeout, cwd=project)
+        result = council(compose(args.task, project, conversation), args.title, selected, args.timeout, cwd=project,
+                         save_sessions=args.save_sessions)
     except KeyboardInterrupt:
         console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
         return 130
     write_report(result, args.show_opinions, args.output)
+    show_sessions(result)
     if args.handoff and result.final:
         hand_back(project or Path.cwd(), conversation, result.final)
     return 0 if result.final else 1
@@ -1131,6 +1245,8 @@ COMMANDS = (
     ("/model [provider] [name]", "show the council, or set a model (provider: claude, gemini, codex; name: default resets)"),
     ("/show <gemini|codex|brief|verdict>", "print the full text from the last round"),
     ("/retry", "ask the last question again"),
+    ("/continue <claude|gemini|codex>", "open the last round in that model's own tool and keep talking"),
+    ("/private", "toggle saving rounds as sessions in Claude Code, Gemini CLI and Codex"),
     ("/opinions", "toggle printing Gemini's and Codex's full replies after each verdict"),
     ("/theme [name]", "list the colour themes, or switch to one"),
     ("/stats", "time, tokens and cost for this session"),
@@ -1150,6 +1266,7 @@ class Session:
         self.selected = selected
         self.timeout = timeout
         self.show_opinions = show_opinions
+        self.save_sessions = True  # keep rounds as resumable sessions in each model's own tool
         self.history: list[tuple[str, str]] = []  # (question, verdict) pairs carried into follow-ups
         self.rounds: list[Round] = []
         self.last_report = ""
@@ -1287,6 +1404,7 @@ class Session:
         parts += [
             ("class:sep", "│  "),
             ("class:bar", f"memory {min(len(self.history), MEMORY)}/{MEMORY}   "),
+            ("class:bar", "saving sessions   " if self.save_sessions else "private   "),
             ("class:sep", "│  "),
             ("class:bar", f"Σ {count(tokens)} tok · {plural(len(self.rounds), 'round')} "),
         ]
@@ -1327,6 +1445,21 @@ class Session:
         elif name == "/new":
             self.history.clear()
             self.note("Started fresh. Earlier answers are forgotten.")
+        elif name == "/continue":
+            provider = ALIASES.get(rest[0].lower(), rest[0].lower()) if rest else ""
+            if provider not in PROVIDERS:
+                console.print(f"  [{BAD}]Usage:[/] /continue <claude|gemini|codex>")
+            elif not last or provider not in last.sessions:
+                self.note(f"The last round has no saved {SESSION_NAMES[provider]} session"
+                          + (" (rounds are private: /private turns saving back on)." if not self.save_sessions else "."))
+            else:
+                self.note(f"Opening {SESSION_NAMES[provider]}. Exit it to come back to Conclave.")
+                subprocess.run(last.sessions[provider], shell=True)
+                console.print()
+        elif name == "/private":
+            self.save_sessions = not self.save_sessions
+            self.note("Rounds are saved as sessions in Claude Code, Gemini CLI and Codex." if self.save_sessions else
+                      "Rounds are private: Claude and Codex keep no session (Gemini CLI always keeps its own history).")
         elif name == "/opinions":
             self.show_opinions = not self.show_opinions
             self.note(f"Adviser opinions will be {'shown' if self.show_opinions else 'hidden'}.")
@@ -1455,12 +1588,13 @@ class Session:
         task = compose(request, self.project, self.conversation, self.history)
         console.print()
         try:
-            result = council(task, request, self.selected, self.timeout, cwd=self.project)
+            result = council(task, request, self.selected, self.timeout, cwd=self.project, save_sessions=self.save_sessions)
         except KeyboardInterrupt:
             console.print(f"\n[bold {BAD}]Cancelled.[/] Stopped the running model calls.")
             return
         self.rounds.append(result)
         self.last_report = write_report(result, self.show_opinions, None) or self.last_report
+        show_sessions(result, interactive=True)
         if result.final:
             self.history.append((request, result.final))
             if not self.show_opinions and result.opinions:
@@ -1570,8 +1704,9 @@ def home(path: Path) -> str:
 
 
 def interactive(selected: dict[str, str | None], timeout: int, show_opinions: bool,
-                project: Path | None = None, conversation=None) -> int:
+                project: Path | None = None, conversation=None, save_sessions: bool = True) -> int:
     session = Session(selected, timeout, show_opinions)
+    session.save_sessions = save_sessions
     session.project, session.conversation = project, conversation
     session.prompt = prompt_session(session)
     session.welcome(animate=ANIMATE)
@@ -1619,9 +1754,13 @@ def main() -> int:
     parser.add_argument("-c", "--conversation", metavar="N|latest|ID",
                         help="bring a Claude Code conversation for the project: its number in --list-conversations, latest, or session id")
     parser.add_argument("--list-conversations", action="store_true", help="list the project's Claude Code conversations and exit")
+    parser.add_argument("--private", action="store_true",
+                        help="don't save this run as sessions in Claude Code, Gemini CLI and Codex (see [sessions] in the config)")
     parser.add_argument("--handoff", action="store_true", help="after the verdict, save it and print the command that gives it back to Claude Code")
     parser.add_argument("--app", action="store_true", help="open the Conclave app in your browser")
-    parser.add_argument("--install-app", action="store_true", help="add Conclave.app to ~/Applications (macOS)")
+    parser.add_argument("--install-app", action="store_true",
+                        help="add Conclave.app to ~/Applications and keep Conclave running at http://localhost:8765 (macOS)")
+    parser.add_argument("--uninstall-app", action="store_true", help="remove Conclave.app and stop it starting at login (macOS)")
     parser.add_argument("--no-animation", action="store_true", help="skip the start-up animation")
     parser.add_argument("task", nargs="*", help="the task for Claude and its advisers (or pipe it on stdin); "
                         "leave it out to open an interactive session")
@@ -1631,6 +1770,9 @@ def main() -> int:
     if args.install_app:
         import conclave_app
         return conclave_app.install_mac_app()
+    if args.uninstall_app:
+        import conclave_app
+        return conclave_app.uninstall_mac_app()
     if args.app:
         import conclave_app
         return conclave_app.main([])
@@ -1652,7 +1794,9 @@ def main() -> int:
             parser.error(f"no Claude Code conversation {args.conversation!r} for {project or Path.cwd()}; see --list-conversations")
         if not project and conversation.project and Path(conversation.project).is_dir():
             project = Path(conversation.project)
+    words = " ".join(args.task).strip()
     args.task = read_task(args.task, sys.stdin)
+    args.title = words or first_line(args.task, 120)  # what the person typed, without any piped file
     session = not args.task and sys.stdin.isatty() and sys.stdout.isatty()
     if not args.task and not session:
         parser.error("give a task as arguments or pipe it on stdin")
@@ -1661,18 +1805,20 @@ def main() -> int:
     ANIMATE = not (args.no_animation or os.environ.get("CONCLAVE_NO_ANIMATION")) and console.is_terminal
 
     try:
-        models, theme = load_config(args.config)
+        settings = load_config(args.config)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    apply_theme(args.theme or theme or "violet")
+    models = settings.models
+    args.save_sessions = settings.save_sessions and not args.private
+    apply_theme(args.theme or settings.theme or "violet")
     selected = {
         "claude": args.claude_model or models.get("claude"),
         "gemini": args.gemini_model or models.get("gemini"),
         "openai": args.openai_model or models.get("openai"),
     }
     if session:
-        return interactive(selected, args.timeout, args.show_opinions, project, conversation)
+        return interactive(selected, args.timeout, args.show_opinions, project, conversation, args.save_sessions)
     return run(args, selected, project, conversation)
 
 

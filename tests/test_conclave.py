@@ -33,7 +33,22 @@ import conclave_context  # noqa: E402
 
 FAKE_CLAUDE = """
 import json, os, sys
+from pathlib import Path
 prompt = sys.stdin.read()
+args = sys.argv[1:]
+if os.environ.get("ARGV_LOG"):
+    open(os.environ["ARGV_LOG"], "a").write(json.dumps(["claude", *args]) + "\\n")
+# Like the real CLI, a resumed session remembers what was said in it before.
+store = Path(__file__).parent / "claude-sessions"
+store.mkdir(exist_ok=True)
+memory = ""
+if "--resume" in args:
+    session = store / args[args.index("--resume") + 1]
+    memory = session.read_text()
+    session.write_text(memory + prompt)
+elif "--session-id" in args:
+    (store / args[args.index("--session-id") + 1]).write_text(prompt)
+seen = memory + prompt
 
 def emit(event):
     print(json.dumps(event), flush=True)
@@ -58,7 +73,7 @@ else:
     for marker, note in (("<input>\\n", "saw piped input"), ("GEMINI SAYS", "saw gemini"), ("CODEX SAYS", "saw codex"),
                          ("did not respond", "told about missing adviser"), ("<previous_exchange>\\n", "saw history"),
                          ("<claude_code_conversation>\\n", "saw conversation"), ("<project_state>\\n", "saw project")):
-        if marker in prompt:
+        if marker in seen:
             notes.append(note)
     say("FINAL ANSWER (" + ", ".join(notes) + ")\\n\\nCOUNCIL: agreement=strong; confidence=high")
 """
@@ -66,6 +81,8 @@ else:
 FAKE_GEMINI = """
 import json, os, sys
 prompt = sys.stdin.read()
+if os.environ.get("ARGV_LOG"):
+    open(os.environ["ARGV_LOG"], "a").write(json.dumps(["gemini", *sys.argv[1:]]) + "\\n")
 assert "BRIEF: weigh cost against speed" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("gemini " + os.getcwd() + "\\n")
@@ -81,13 +98,18 @@ emit({"type": "result", "status": "success", "stats": {"total_tokens": 30, "inpu
 
 FAKE_CODEX = """
 import json, os, sys
+if sys.argv[1:2] == ["resume"]:  # `codex resume <id>` from /continue
+    print("RESUMED " + sys.argv[2])
+    sys.exit(0)
 prompt = sys.stdin.read()
+if os.environ.get("ARGV_LOG"):
+    open(os.environ["ARGV_LOG"], "a").write(json.dumps(["codex", *sys.argv[1:]]) + "\\n")
 assert "BRIEF: weigh cost against speed" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("codex " + os.getcwd() + "\\n")
 def emit(event):
     print(json.dumps(event), flush=True)
-emit({"type": "thread.started", "thread_id": "t"})
+emit({"type": "thread.started", "thread_id": "codex-thread-1"})
 emit({"type": "turn.started"})
 emit({"type": "item.completed", "item": {"id": "0", "type": "reasoning", "text": "**Checking the brief**"}})
 emit({"type": "item.started", "item": {"id": "1", "type": "command_execution", "command": "ls", "status": "in_progress"}})
@@ -204,6 +226,20 @@ def test_task_can_come_only_from_stdin(fake_bin, tmp_path):
     assert result.stdout.startswith("FINAL ANSWER")
 
 
+def test_silent_stdin_does_not_block(fake_bin, tmp_path):
+    # stdin is a pipe that stays open and silent, as some task runners and schedulers provide.
+    read_end, write_end = os.pipe()
+    try:
+        result = subprocess.run([sys.executable, str(ROOT / "conclave.py"), "Pick a database"], stdin=read_end,
+                                capture_output=True, text=True, timeout=60, env=env_for(fake_bin, tmp_path), cwd=tmp_path)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("FINAL ANSWER")
+    assert "nothing arrived on stdin" in result.stderr
+
+
 def test_missing_task_is_a_usage_error(fake_bin, tmp_path):
     result = run_cli(fake_bin, tmp_path=tmp_path)
     assert result.returncode == 2
@@ -284,6 +320,49 @@ def test_timeout_stops_the_whole_process_group(fake_bin, tmp_path):
     assert not running(child)
 
 
+def argv_log(path: Path) -> dict[str, list[list[str]]]:
+    calls: dict[str, list[list[str]]] = {}
+    for line in path.read_text().splitlines():
+        command = json.loads(line)
+        calls.setdefault(command[0], []).append(command[1:])
+    return calls
+
+
+def test_rounds_are_saved_as_sessions_in_each_tool(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "Pick a database", stdin="the schema", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    # The verdict comes from a resumed session that already holds the task, and still sees everything.
+    assert result.stdout == "FINAL ANSWER (saw piped input, saw gemini, saw codex)\n"
+    calls = argv_log(log)
+    brief, verdict = calls["claude"]
+    lead = brief[brief.index("--session-id") + 1]
+    assert brief[brief.index("--name") + 1] == "Conclave · Pick a database"
+    assert verdict[verdict.index("--resume") + 1] == lead and "--session-id" not in verdict
+    assert "--no-session-persistence" not in brief + verdict
+    gemini = calls["gemini"][0][calls["gemini"][0].index("--session-id") + 1]
+    assert "--ephemeral" not in calls["codex"][0]
+    stderr = re.sub(r"\s+", " ", result.stderr)
+    assert f"continue in Claude Code: cd {tmp_path} && claude --resume {lead}" in stderr
+    assert f"continue in Gemini CLI: cd {tmp_path} && gemini --resume {gemini}" in stderr
+    assert f"continue in Codex: cd {tmp_path} && codex resume codex-thread-1" in stderr
+
+
+def test_private_runs_leave_no_sessions(fake_bin, tmp_path):
+    for args, config in ((["--private"], ""), ([], "[sessions]\nsave = false\n")):
+        log = tmp_path / "argv.log"
+        log.unlink(missing_ok=True)
+        (tmp_path / "config" / "conclave").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "conclave" / "config.toml").write_text(config)
+        result = run_cli(fake_bin, *args, "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "FINAL ANSWER (saw gemini, saw codex)\n"
+        calls = argv_log(log)
+        assert all("--no-session-persistence" in call for call in calls["claude"])
+        assert "--session-id" not in calls["gemini"][0] and "--ephemeral" in calls["codex"][0]
+        assert "continue in" not in result.stderr
+
+
 def test_commands_stream_and_send_prompts_on_stdin():
     command, stdin = conclave.command_for("gemini", "a very long prompt", "gemini-x")
     assert stdin == "a very long prompt"
@@ -312,7 +391,10 @@ def test_config_rejects_unknown_provider(tmp_path):
 def test_config_theme(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text('[ui]\ntheme = "ember"\n')
-    assert conclave.load_config(config) == ({}, "ember")
+    assert conclave.load_config(config) == conclave.Settings({}, "ember", True)
+    config.write_text('[sessions]\nsave = false\n')
+    assert conclave.load_config(config).save_sessions is False
+    config.write_text('[ui]\ntheme = "plaid"\n')
     config.write_text('[ui]\ntheme = "plaid"\n')
     with pytest.raises(ValueError, match="Unknown theme 'plaid'"):
         conclave.load_config(config)
@@ -493,6 +575,8 @@ def test_interactive_session(fake_bin, tmp_path):
     term.command("Pick a database", "FINAL ANSWER (saw gemini, saw codex)", "AGREEMENT")
     term.command("And for caching?", "saw history", "memory 2/3")
     term.command("/show gemini", "GEMINI SAYS go")
+    term.command("/continue codex", "Opening Codex", "RESUMED codex-thread-1")
+    term.command("/private", "Rounds are private")
     term.command("/model codex gpt-x", "now uses gpt-x")
     term.command("/theme ember", "Theme: ember")
     term.command("/stats", "SESSION", "2 strong")
@@ -593,6 +677,9 @@ def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):
     assert "saw conversation" in result["final"] and "saw history" in result["final"]
     assert (result["agreement"], result["confidence"]) == ("strong", "high")
     assert result["opinions"]["gemini"] == "GEMINI SAYS go"
+    assert set(result["sessions"]) == {"claude", "gemini", "openai"}
+    resumed = call(base, f"/api/runs/{run['id']}/continue", app.token, {"provider": "codex"})
+    assert resumed["command"].endswith("codex resume codex-thread-1")
     handed = call(base, f"/api/runs/{run['id']}/handoff", app.token, {})
     assert Path(handed["path"]).parent == project / ".conclave"
     assert "--resume abc12345-0000" in handed["command"]
@@ -625,7 +712,12 @@ def test_app_cancel_stops_the_round(app_server, fake_bin, tmp_path):
 
 
 def test_mac_app_bundle(tmp_path):
-    assert conclave_app.install_mac_app(tmp_path) == 0
+    agents = tmp_path / "LaunchAgents"
+    assert conclave_app.install_mac_app(tmp_path, agents, start=False) == 0
+    agent = plistlib.loads((agents / "io.github.shrestha-droid.conclave.plist").read_bytes())
+    assert agent["ProgramArguments"][-2:] == ["--port", "8765"] and agent["RunAtLoad"] is True
+    assert agent["EnvironmentVariables"]["PATH"] == os.environ["PATH"]
+    assert agent["KeepAlive"] == {"SuccessfulExit": False}
     contents = tmp_path / "Conclave.app" / "Contents"
     launcher = contents / "MacOS" / "Conclave"
     assert os.access(launcher, os.X_OK)
@@ -635,3 +727,5 @@ def test_mac_app_bundle(tmp_path):
     assert info["CFBundleExecutable"] == "Conclave" and info["CFBundleShortVersionString"] == conclave.__version__
     png = (contents / "Resources" / "Conclave.png").read_bytes()
     assert png.startswith(b"\x89PNG\r\n\x1a\n") and struct.unpack(">II", png[16:24]) == (512, 512)
+    assert conclave_app.uninstall_mac_app(tmp_path, agents, stop_now=False) == 0
+    assert not (tmp_path / "Conclave.app").exists() and not list(agents.iterdir())

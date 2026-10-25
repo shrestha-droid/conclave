@@ -32,6 +32,7 @@ import conclave as core
 import conclave_context as context
 
 DEFAULT_PORT = 8765
+AGENT_LABEL = "io.github.shrestha-droid.conclave"
 STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "conclave" / "app.json"
 
 
@@ -103,6 +104,7 @@ def outcome(result: core.Round) -> dict:
         "failed": result.failed,
         "errors": [{"provider": p, "headline": h, "message": m, "fix": core.fix_for(p, m)} for p, h, m in result.errors],
         "meta": core.round_meta(result),
+        "sessions": result.sessions,
         "tokens": [result.tokens_in, result.tokens_out],
         "cost": result.cost,
         "seconds": result.seconds,
@@ -112,9 +114,10 @@ def outcome(result: core.Round) -> dict:
 # ---------------------------------------------------------------- server
 
 class App:
-    def __init__(self, selected: dict[str, str | None], timeout: int):
+    def __init__(self, selected: dict[str, str | None], timeout: int, save_sessions: bool = True):
         self.selected = selected
         self.timeout = timeout
+        self.save_sessions = save_sessions
         self.token = secrets.token_urlsafe(24)
         self.runs: dict[str, Run] = {}
         self.server: ThreadingHTTPServer | None = None
@@ -126,6 +129,7 @@ class App:
             "theme": core.THEME,
             "themes": core.THEMES,
             "timeout": self.timeout,
+            "saveSessions": self.save_sessions,
             "providers": [
                 {"id": name, "label": core.LABELS[name], "role": core.ROLES[name], "cli": core.PROVIDERS[name],
                  "installed": bool(shutil.which(core.PROVIDERS[name])), "model": self.selected[name],
@@ -171,13 +175,15 @@ class App:
                 selected[name] = model.strip() or self.selected[name]
         timeout = int(body.get("timeout") or self.timeout)
         history = [(str(q), str(a)) for q, a in (body.get("history") or [])][-core.MEMORY:]
+        save_sessions = bool(body.get("saveSessions", self.save_sessions))
         run = Run(project, conversation)
         self.runs[run.id] = run
 
         def work() -> None:
             try:
                 task = core.compose(question, project, conversation, history)
-                result = core.deliberate(task, selected, timeout, WebView(run), cwd=project, control=run.control)
+                result = core.deliberate(task, selected, timeout, WebView(run), cwd=project, control=run.control,
+                                         title=question, save_sessions=save_sessions)
                 result.request = question
                 run.result = result
                 run.emit({"type": "done", "result": outcome(result)})
@@ -190,6 +196,23 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
         return run
+
+    def resume(self, run: Run, provider: str) -> dict:
+        """Open a model's saved session from this round in a Terminal window (macOS), or return the command."""
+        provider = core.ALIASES.get(provider, provider)
+        command = (run.result.sessions if run.result else {}).get(provider)
+        if not command:
+            raise ValueError("That session wasn't saved")
+        opened = False
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            script = command.replace("\\", "\\\\").replace('"', '\\"')
+            try:
+                subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
+                                "-e", 'tell application "Terminal" to activate'], check=True, capture_output=True, timeout=15)
+                opened = True
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return {"command": command, "opened": opened}
 
     def handoff(self, run: Run) -> dict:
         if not run.result or not run.result.final:
@@ -268,6 +291,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, {"ok": True})
                 if method == "POST" and parts[2:] == ["handoff"]:
                     return self.send(200, self.app.handoff(run))
+                if method == "POST" and parts[2:] == ["continue"]:
+                    return self.send(200, self.app.resume(run, str(self.body().get("provider") or "")))
             if method == "POST" and parts == ["shutdown"]:
                 self.send(200, {"ok": True})
                 core.stop_all()
@@ -341,20 +366,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=300, help="seconds allowed per model call (default: 300)")
     args = parser.parse_args(argv)
 
-    if not args.port:
-        existing = running_instance()
-        if existing:
-            print(f"Conclave is already running at {existing}")
-            if not args.no_browser:
-                webbrowser.open(existing)
-            return 0
+    existing = running_instance()
+    if existing:
+        print(f"Conclave is already running at {existing}")
+        if not args.no_browser:
+            webbrowser.open(existing)
+        return 0
     try:
-        models, theme = core.load_config(core.CONFIG_PATH)
+        settings = core.load_config(core.CONFIG_PATH)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    core.apply_theme(theme or "violet")
-    app = App({name: models.get(name) for name in core.PROVIDERS}, args.timeout)
+    core.apply_theme(settings.theme or "violet")
+    app = App({name: settings.models.get(name) for name in core.PROVIDERS}, args.timeout, settings.save_sessions)
     server = serve(app, args.port or DEFAULT_PORT)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
@@ -421,8 +445,32 @@ def icon_png(size: int) -> bytes:
 ICON_64 = icon_png(64)
 
 
-def install_mac_app(destination: Path | None = None) -> int:
-    """Create Conclave.app: double-click it (or find it in Spotlight) to open the app in your browser."""
+def launch_agent() -> dict:
+    """A login item that keeps the Conclave app running in the background at http://localhost:8765."""
+    log = Path.home() / "Library" / "Logs" / "Conclave.log"
+    return {
+        "Label": AGENT_LABEL,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "--no-browser", "--port", str(DEFAULT_PORT)],
+        # launchd starts programs with a minimal PATH; keep the one that finds claude, gemini and codex right now.
+        "EnvironmentVariables": {"PATH": os.environ.get("PATH", "")},
+        "WorkingDirectory": str(Path.home()),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},  # restart after a crash, not after the Quit button
+        "ProcessType": "Interactive",
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    }
+
+
+def launchctl(*args: str) -> bool:
+    try:
+        return subprocess.run(["launchctl", *args], capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def install_mac_app(destination: Path | None = None, agents: Path | None = None, start: bool = True) -> int:
+    """Create Conclave.app and a login item that keeps Conclave running at http://localhost:8765."""
     if destination is None and sys.platform != "darwin":
         print("Conclave.app is for macOS. On this system, run `conclave --app` to open the app in your browser.")
         return 1
@@ -470,8 +518,34 @@ def install_mac_app(destination: Path | None = None) -> int:
             pass
         shutil.rmtree(iconset, ignore_errors=True)
     print(f"✦ Installed {bundle}")
-    print("  Open it from Spotlight or Launchpad (search “Conclave”), or drag it to your Dock.")
-    print("  It opens in your browser; the Quit button in the page stops it.")
+
+    agents = agents or Path.home() / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = agents / f"{AGENT_LABEL}.plist"
+    plist.write_bytes(plistlib.dumps(launch_agent()))
+    if start:
+        (Path.home() / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
+        domain = f"gui/{os.getuid()}"
+        launchctl("bootout", domain, str(plist))  # replace an earlier version if one is loaded
+        if launchctl("bootstrap", domain, str(plist)):
+            for _ in range(40):
+                if running_instance():
+                    break
+                time.sleep(0.25)
+    print(f"✦ Conclave now starts when you log in and stays at http://localhost:{DEFAULT_PORT}. Bookmark it.")
+    print("  Open Conclave.app from Spotlight, Launchpad or the Dock to bring it up in your browser.")
+    print("  `conclave --uninstall-app` removes both.")
+    return 0
+
+
+def uninstall_mac_app(destination: Path | None = None, agents: Path | None = None, stop_now: bool = True) -> int:
+    """Remove Conclave.app and the login item."""
+    plist = (agents or Path.home() / "Library" / "LaunchAgents") / f"{AGENT_LABEL}.plist"
+    if stop_now and plist.exists() and hasattr(os, "getuid"):
+        launchctl("bootout", f"gui/{os.getuid()}", str(plist))
+    plist.unlink(missing_ok=True)
+    shutil.rmtree((destination or Path.home() / "Applications") / "Conclave.app", ignore_errors=True)
+    print("✦ Removed Conclave.app and its login item. The `conclave` command is still installed.")
     return 0
 
 
@@ -624,6 +698,12 @@ details.opinion .text{padding:0 18px 14px;font-size:14px}
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--accent);padding:10px 16px;border-radius:12px;opacity:0;transition:.25s;pointer-events:none}
 .toast.show{opacity:1}
 select.field{width:auto;padding:5px 9px}
+.toggle{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer}
+.toggle input{accent-color:var(--accent)}
+.toggle + .go{margin-left:0}
+.continue{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 16px 16px;font-size:12px;color:var(--muted)}
+.continue .btn{border-color:color-mix(in srgb,var(--c) 45%,transparent)}
+.continue .btn b{color:var(--c)}
 main,.wrap,.run,.card,.composer{min-width:0}
 .body,.verdict .text,.handoff,.problem,.opinion .text{overflow-wrap:anywhere}
 @media (max-width:1050px){.cards{grid-template-columns:1fr}.app{grid-template-columns:1fr}aside{display:none}.app.sidebar aside{display:flex}.modelgrid{grid-template-columns:1fr 1fr}.app.sidebar aside{max-height:55vh;border-right:0;border-bottom:1px solid var(--edge)}}
@@ -668,6 +748,7 @@ main,.wrap,.run,.card,.composer{min-width:0}
         <details class="models"><summary>⚙ Models and timeout</summary>
           <div class="modelgrid" id="modelgrid"></div>
         </details>
+        <label class="toggle" title="Keep this round as sessions you can continue in Claude Code, Gemini CLI and Codex"><input type="checkbox" id="save"> Save sessions</label>
         <button class="go" id="ask">Ask the council <kbd>⌘↵</kbd></button>
       </div>
     </div>
@@ -764,6 +845,8 @@ async function boot() {
     + `<label>TIMEOUT (s)<input class="field" id="timeout" type="number" min="10" value="${store.get("timeout", state.info.timeout)}"></label>`;
   $("#modelgrid").oninput = () => { const m = {}; document.querySelectorAll("[data-model]").forEach(e => m[e.dataset.model] = e.value.trim());
     store.set("models", m); store.set("timeout", +$("#timeout").value || state.info.timeout); };
+  $("#save").checked = store.get("saveSessions", state.info.saveSessions);
+  $("#save").onchange = () => store.set("saveSessions", $("#save").checked);
   await loadProjects();
   const last = store.get("project", null);
   const pick = last && state.projects.find(p => p.path === last) ? last : (state.projects.find(p => p.path === state.info.cwd) ? state.info.cwd : null);
@@ -828,7 +911,8 @@ async function ask() {
   if (!question) { $("#question").focus(); return; }
   const models = store.get("models", {}), timeout = store.get("timeout", state.info.timeout);
   let id;
-  try { id = (await api("/api/runs", {question, project: state.project, conversation: state.conversation, models, timeout, history: state.history.slice(-3)})).id; }
+  try { id = (await api("/api/runs", {question, project: state.project, conversation: state.conversation, models, timeout, history: state.history.slice(-3),
+    saveSessions: $("#save").checked})).id; }
   catch (e) { toast(e.message); return; }
   $("#hello")?.remove(); $("#question").value = "";
   const conv = state.convos.find(c => c.id === state.conversation);
@@ -840,7 +924,7 @@ async function ask() {
     <div class="cards">${["claude", "gemini", "openai"].map(n => card(n, providers[n])).join("")}</div>
     <div class="problems"></div>
     <div class="verdict"><div class="in"><h3><span class="wordmark">✦ VERDICT</span><span class="drafting">DRAFTING…</span></h3><div class="text"></div><div class="meterbox"></div></div></div>
-    <div class="actions"></div><div class="opinions"></div>`;
+    <div class="actions"></div><div class="continue"></div><div class="opinions"></div>`;
   $("#runs").prepend(el);
   follow(id, el, question);
 }
@@ -909,6 +993,17 @@ function finish(el, e, question) {
       box.innerHTML = `Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue the Claude Code conversation with the verdict:<pre>${esc(h.command)}</pre>`;
       navigator.clipboard.writeText(h.command).then(() => toast("Command copied — paste it in Terminal"), () => {});
     } catch (err) { toast(err.message); } };
+  const tools = {claude: ["✦", "Claude Code"], gemini: ["✧", "Gemini CLI"], openai: ["✳", "Codex"]};
+  const saved = Object.keys(tools).filter(n => r.sessions && r.sessions[n]);
+  const cont = el.querySelector(".continue");
+  if (saved.length) {
+    cont.innerHTML = `<span>↪ Continue in:</span>` + saved.map(n => `<button class="btn" style="--c:var(--${n})" data-tool="${n}"><b>${tools[n][0]}</b> ${tools[n][1]}</button>`).join("");
+    cont.querySelectorAll("[data-tool]").forEach(b => b.onclick = async () => {
+      try { const res = await api(`/api/runs/${el.dataset.run}/continue`, {provider: b.dataset.tool});
+        if (res.opened) toast(`Opened in Terminal: ${tools[b.dataset.tool][1]}`);
+        else navigator.clipboard.writeText(res.command).then(() => toast("Command copied: paste it in a terminal"), () => toast(res.command));
+      } catch (err) { toast(err.message); } });
+  }
   el.querySelector(".opinions").innerHTML = [["brief", "claude", "✦ CLAUDE · BRIEF", r.brief], ...Object.entries(r.opinions).map(([n, t]) => [n, n, `${n === "gemini" ? "✧" : "✳"} ${NAMES[n]} · OPINION`, t])]
     .filter(x => x[3]).map(([, n, title, t]) => `<details class="opinion" style="--c:var(--${n})"><summary>${esc(title)}</summary><div class="text">${md(t)}</div></details>`).join("");
   state.history.push([question, r.final]); renderContext();

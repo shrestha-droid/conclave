@@ -48,13 +48,24 @@ When the verdict is in, the app shows:
 cd ~/code/shop-api && claude --resume <session-id> 'Gemini and Codex reviewed this conversation in Conclave. Read .conclave/verdict-….md …'
 ```
 
-On a Mac, add a Conclave icon to Applications so you can open it from Spotlight, Launchpad or the Dock:
+### Always on, for every project (macOS)
 
 ```sh
 conclave --install-app
 ```
 
-Conclave.app runs in the background and opens in your browser; the **Quit** button in the page stops it. It remembers the `PATH` from when you installed it so it can find `claude`, `gemini` and `codex`; run `--install-app` again if you move them.
+This keeps Conclave running in the background from the moment you log in, always at **http://localhost:8765**, so you can bookmark it. It also adds Conclave.app to Applications, so you can open it from Spotlight, Launchpad or the Dock. The sidebar shows every project you've used Claude Code in, so one bookmark covers all of them.
+
+- The **Quit** button in the page stops Conclave until you next log in or open Conclave.app.
+- Logs go to `~/Library/Logs/Conclave.log`.
+- It remembers the `PATH` from when you installed it, so it can find `claude`, `gemini` and `codex`. Run `--install-app` again if you move them.
+- `conclave --uninstall-app` removes the app and the login item.
+
+On Linux and Windows, run `conclave --app` when you want it.
+
+### Why it isn't hosted on Vercel
+
+Conclave runs on your computer on purpose. It uses the `claude`, `gemini` and `codex` tools you're already signed in to, so it costs nothing beyond your subscriptions. It also reads your Claude Code conversations and project files from your disk. A hosted site can do neither: it would need separately billed API keys, and you'd have to upload conversations and code to it.
 
 The app only listens on 127.0.0.1, and it only answers requests that carry a secret token from the page it served. That stops other websites from starting rounds.
 
@@ -81,6 +92,8 @@ Why does test_login keep failing after the session refactor?
 | `/detach` | Stop sending it |
 | `/project [path\|none]` | Show or set the folder the models read and review |
 | `/handoff` | Save the last verdict in the project and show the `claude --resume` command (copied to the clipboard on macOS) |
+| `/continue <claude\|gemini\|codex>` | Open the last round in that model's own tool and keep talking; exit it to come back |
+| `/private` | Toggle saving rounds as sessions in the three tools |
 | `/show <gemini\|codex\|brief\|verdict>` | Print the full text from the last round |
 | `/retry` | Ask the last question again |
 | `/opinions` | Toggle printing both opinions after each verdict |
@@ -109,6 +122,20 @@ conclave "Compare these options" > answer.md
 - The dashboard is drawn on stderr, so stdout carries only the verdict; a one-line summary with agreement and token use follows on stderr.
 - `--output FILE` saves the verdict, and `--show-opinions` adds both opinions.
 
+## Your rounds in Claude Code, Gemini CLI and Codex
+
+Each round is also saved in each model's own tool, so you can carry on with any of them there:
+
+- **Claude Code:** the brief and the verdict are one session named "Conclave · your question". It appears in `claude --resume`, and Conclave's conversation list shows it too.
+- **Gemini CLI:** the opinion is a session you can open with `gemini --resume <id>`.
+- **Codex:** the opinion is kept, and `codex resume <id>` opens it. Codex uses your ChatGPT account.
+
+After each verdict Conclave shows the exact command for each. In the app, **Continue in** buttons open a Terminal window already in that session (on a Mac; elsewhere they copy the command). In the terminal, use `/continue codex` and the like.
+
+claude.ai, gemini.google.com and chatgpt.com don't let any app add conversations to your history, so rounds can't appear there.
+
+Use `--private` for one run, `/private` in a session, the app's **Save sessions** switch, or `[sessions] save = false` in the config, and Claude Code and Codex keep no session. Gemini CLI always keeps its own session history.
+
 ## Settings
 
 Create `~/.config/conclave/config.toml` (or `$XDG_CONFIG_HOME/conclave/config.toml`):
@@ -121,6 +148,9 @@ codex = "OPENAI_MODEL_ID"   # "openai" works too
 
 [ui]
 theme = "aurora"            # violet, ember, aurora, matrix or mono
+
+[sessions]
+save = true                 # false: don't keep rounds in Claude Code, Gemini CLI and Codex
 ```
 
 Flags such as `--claude-model`, `--theme` and `--timeout` override these for one run. An unknown provider or theme name is reported as an error, so a typo doesn't silently fall back to a default. Use another file with `--config path/to/config.toml`.
@@ -129,13 +159,14 @@ Flags such as `--claude-model`, `--theme` and `--timeout` override these for one
 
 Your question, and anything you attach, goes to Anthropic, Google and OpenAI through their CLIs: the condensed conversation, the project's git state and diff, and earlier answers in the session. The models can also read files in the project folder. Don't attach a conversation or project you wouldn't share with all three.
 
-All three run read-only: Claude in plan mode, Gemini in plan approval mode and Codex in a read-only sandbox. Gemini CLI uses its default approval mode in folders you haven't trusted. In non-interactive runs it still can't edit files or run shell commands without approval. Conclave itself writes only what you ask for (`.conclave/verdict-*.md` on hand-back, and files you name with `/save`, `/export` or `--output`), plus its prompt history and app state in `~/.local/state/conclave`.
+All three run read-only: Claude in plan mode, Gemini in plan approval mode and Codex in a read-only sandbox. Gemini CLI uses its default approval mode in folders you haven't trusted. In non-interactive runs it still can't edit files or run shell commands without approval. Conclave itself writes only what you ask for (`.conclave/verdict-*.md` on hand-back, and files you name with `/save`, `/export` or `--output`), plus its prompt history and app state in `~/.local/state/conclave`. Each round is also saved as sessions in the three tools unless you make it private (see above).
 
 ## Limits and behaviour
 
 - **Timeouts:** each model call has a 300-second timeout (`--timeout`). On a timeout or Ctrl+C, Conclave stops the CLI and every process it started.
 - **Missing advisers:** if one adviser fails, Claude answers with the opinion it has and says one was missing. Failures are shown with the fix Conclave recognizes, such as the sign-in or install command.
 - **Changed output formats:** Conclave reads each CLI's streaming JSON output. If a CLI's format changes so that no answer can be read, Conclave retries that model once with plain-text output.
+- **Silent stdin:** if a task is given as words and nothing arrives on a piped stdin within 2 seconds (some task runners leave an empty pipe open), Conclave goes ahead without it.
 - **Exit status:** 0 when Claude writes the verdict, 1 when it can't, 2 for a usage or config error, and 130 when cancelled.
 
 ## Run the tests
