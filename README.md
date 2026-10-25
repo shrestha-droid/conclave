@@ -2,7 +2,7 @@
 
 When a Claude Code project gets stuck on an error that a fresh pair of eyes would spot, bring it to the council. Conclave reads the Claude Code conversation you were having (including the errors Claude hit), looks at the project's git state, and asks Gemini and Codex for independent opinions while they read the code themselves. Claude, as lead, weighs everything and writes one verdict, and you can hand that verdict straight back to the same Claude Code conversation.
 
-It works on any question too: Claude leads, Gemini and Codex advise, and you can pick the model for each.
+It works on any question too: Claude leads, Gemini and Codex advise, and you can pick the model for each. You can seat more advisers (Qwen Code, GitHub Copilot CLI, OpenCode, Ollama, or any command-line AI you add), and for a big task Claude can split the work into subtasks and hand each to the agent best suited to it.
 
 Conclave coordinates the Claude Code, Gemini and Codex command-line tools you already have and are signed in to. It doesn't replace them, and their account rules and usage limits apply.
 
@@ -97,6 +97,11 @@ Why does test_login keep failing after the session refactor?
 | `/show <gemini\|codex\|brief\|verdict>` | Print the full text from the last round |
 | `/retry` | Ask the last question again |
 | `/opinions` | Toggle printing both opinions after each verdict |
+| `/agents [add\|remove] [agent]` | List every agent Conclave knows, or seat and unseat advisers |
+| `/split [auto\|always\|never]` | Whether Claude may split a big task into subtasks |
+| `/quick` | Turn the cross-examination round off or on |
+| `/setup` | Check each seated agent is installed and signed in, and fix any that aren't |
+| `!<command>` | Run a shell command without leaving Conclave |
 | `/model [provider] [name]` | Show the models, or set one (`claude`, `gemini` or `codex`; `default` resets it) |
 | `/theme [name]` | List the themes (violet, ember, aurora, matrix, mono), or switch |
 | `/stats` | Time, tokens, cost and agreement for the session |
@@ -121,6 +126,30 @@ conclave "Compare these options" > answer.md
 - Piped text is added to the task as material to review.
 - The dashboard is drawn on stderr, so stdout carries only the verdict; a one-line summary with agreement and token use follows on stderr.
 - `--output FILE` saves the verdict, and `--show-opinions` adds both opinions.
+
+## More agents, and splitting big tasks
+
+Claude always leads. Gemini and Codex advise by default, and these can join them:
+
+| Agent | Install | Runs as |
+| --- | --- | --- |
+| Qwen Code (`qwen`) | `npm install -g @qwen-code/qwen-code` | plan mode: analyses only |
+| GitHub Copilot CLI (`copilot`) | `npm install -g @github/copilot` | write and shell tools denied |
+| OpenCode (`opencode`) | `npm install -g opencode-ai` | its read-only `plan` agent |
+| Ollama (`ollama`) | [ollama.com/download](https://ollama.com/download) | a local model, private and offline |
+
+Seat them with `/agents add qwen`, the app's Council row, `--advisers gemini,codex,qwen`, or `[council] advisers` in the config. Any other command-line AI that reads a prompt on stdin can join too:
+
+```toml
+[agents.mistral]
+command = "ollama run mistral"
+label = "Mistral"
+strengths = "small local model, private"
+```
+
+**Cross-examination.** After the advisers answer, each one reads the others' opinions and says where they're wrong before Claude writes the verdict. It's on by default; `--quick` or `/quick` skips it.
+
+**Splitting.** With `split = "auto"` (the default), Claude decides as it reads the task. A big task that splits into independent parts becomes a plan of 2 to 6 subtasks, each given to the adviser whose strengths fit it. Each adviser works through its own subtasks, all of them at the same time, and Claude combines the results. Use `--split always|never` or `/split` to choose.
 
 ## Your rounds in Claude Code, Gemini CLI and Codex
 
@@ -151,6 +180,11 @@ theme = "aurora"            # violet, ember, aurora, matrix or mono
 
 [sessions]
 save = true                 # false: don't keep rounds in Claude Code, Gemini CLI and Codex
+
+[council]
+advisers = ["gemini", "codex"]   # add "qwen", "copilot", "opencode", "ollama" or your own
+cross_examine = true
+split = "auto"                   # "always" or "never"
 ```
 
 Flags such as `--claude-model`, `--theme` and `--timeout` override these for one run. An unknown provider or theme name is reported as an error, so a typo doesn't silently fall back to a default. Use another file with `--config path/to/config.toml`.

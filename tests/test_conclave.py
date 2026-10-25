@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import conclave  # noqa: E402
+import conclave_agents  # noqa: E402
 import conclave_app  # noqa: E402
 import conclave_context  # noqa: E402
 
@@ -72,14 +73,19 @@ def say(text):
 
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("claude " + os.getcwd() + "\\n")
-if "Prepare a concise review brief" in prompt:
+if "Your advisers:" in prompt and os.environ.get("FAKE_PLAN"):
+    say(json.dumps({"plan": [{"agent": "gemini", "title": "Map the schema", "instructions": "List the tables"},
+                             {"agent": "codex", "title": "Run the tests", "instructions": "Run pytest"},
+                             {"agent": "nobody", "title": "Check the docs", "instructions": "Read the README"}]}))
+elif "Prepare a concise review brief" in prompt:
     say("BRIEF: weigh cost against speed")
 else:
     notes = []
     for marker, note in (("<input>\\n", "saw piped input"), ("GEMINI SAYS", "saw gemini"), ("CODEX SAYS", "saw codex"),
                          ("did not respond", "told about missing adviser"), ("<previous_exchange>\\n", "saw history"),
                          ("<claude_code_conversation>\\n", "saw conversation"), ("<project_state>\\n", "saw project"),
-                         ("<gemini_rebuttal>\\n", "saw rebuttals")):
+                         ("<rebuttal agent=", "saw rebuttals"), ("<subtask number=", "saw subtasks"),
+                         ("ECHO SAYS", "saw echo")):
         if marker in seen:
             notes.append(note)
     say("FINAL ANSWER (" + ", ".join(notes) + ")\\n\\nCOUNCIL: agreement=strong; confidence=high")
@@ -93,7 +99,7 @@ if sys.argv[1:2] == ["--version"]:
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["gemini", *sys.argv[1:]]) + "\\n")
-assert "BRIEF: weigh cost against speed" in prompt
+assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("gemini " + os.getcwd() + "\\n")
 def emit(event):
@@ -120,7 +126,7 @@ if sys.argv[1:3] == ["login", "status"]:
 prompt = sys.stdin.read()
 if os.environ.get("ARGV_LOG"):
     open(os.environ["ARGV_LOG"], "a").write(json.dumps(["codex", *sys.argv[1:]]) + "\\n")
-assert "BRIEF: weigh cost against speed" in prompt
+assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt
 if os.environ.get("CWD_LOG"):
     open(os.environ["CWD_LOG"], "a").write("codex " + os.getcwd() + "\\n")
 def emit(event):
@@ -136,7 +142,7 @@ emit({"type": "turn.completed", "usage": {"input_tokens": 40, "cached_input_toke
 FAKE_PLAIN = """
 import sys
 prompt = sys.stdin.read()
-assert "BRIEF: weigh cost against speed" in prompt
+assert "BRIEF: weigh cost against speed" in prompt or "YOUR SUBTASK:" in prompt
 print("{name} SAYS go")
 """
 
@@ -409,6 +415,66 @@ def test_setup_reports_each_tool(fake_bin, tmp_path):
     assert "not installed" in missing.stderr and "npm install -g @google/gemini-cli" in missing.stderr
 
 
+FAKE_ECHO = """
+import sys
+prompt = sys.stdin.read()
+print("ECHO SAYS go")
+"""
+
+
+def test_custom_agent_joins_the_council(fake_bin, tmp_path):
+    install(fake_bin, "echoagent", FAKE_ECHO)
+    log = tmp_path / "argv.log"
+    (tmp_path / "config" / "conclave").mkdir(parents=True)
+    (tmp_path / "config" / "conclave" / "config.toml").write_text(
+        f'[agents.echo]\ncommand = "{fake_bin / "echoagent"}"\nlabel = "Echo"\nstrengths = "repeats things"\n\n'
+        '[council]\nadvisers = ["gemini", "codex", "echo"]\n')
+    result = run_cli(fake_bin, "--show-opinions", "Pick a database", tmp_path=tmp_path, ARGV_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert "saw gemini, saw codex, saw rebuttals" in result.stdout and "saw echo" in result.stdout
+    assert "● ECHO · OPINION" in result.stdout
+    assert len(argv_log(log)["gemini"]) == 2  # three advisers still cross-examine each other
+    assert "3/3 advisers" in result.stderr
+
+
+def test_claude_splits_a_task_into_subtasks(fake_bin, tmp_path):
+    log = tmp_path / "argv.log"
+    result = run_cli(fake_bin, "--split", "always", "--show-opinions", "Audit the whole app", tmp_path=tmp_path,
+                     ARGV_LOG=str(log), FAKE_PLAN="1")
+    assert result.returncode == 0, result.stderr
+    assert "saw subtasks" in result.stdout and "saw gemini" in result.stdout and "saw codex" in result.stdout
+    assert "saw rebuttals" not in result.stdout  # no cross-examination in a split round
+    calls = argv_log(log)
+    # "nobody" isn't an adviser, so its subtask goes round-robin: gemini gets two subtasks, codex one.
+    assert len(calls["gemini"]) == 2 and len(calls["codex"]) == 1
+    assert "3/3 subtasks" in result.stderr
+    assert "GEMINI · SUBTASKS" in result.stdout and "### Map the schema" in result.stdout
+
+
+def test_plan_parsing():
+    advisers = ("gemini", "openai")
+    plan = conclave.parse_plan('Sure: {"plan": [{"agent": "Codex", "title": "Run tests", "instructions": "pytest"}]}', advisers)
+    assert plan == [{"agent": "openai", "title": "Run tests", "instructions": "pytest"}]
+    assert conclave.parse_plan("BRIEF: no plan here", advisers) is None
+    assert conclave.parse_plan('{"plan": "not a list"}', advisers) is None
+
+
+def test_qwen_style_stream_and_sprites():
+    stream = feed("qwen", [{"type": "assistant", "parent_tool_use_id": None,
+                            "message": {"content": [{"type": "text", "text": "Qwen answer"}]}},
+                           {"type": "result", "subtype": "success", "result": "Qwen answer"}])
+    assert stream.reply("qwen", 0, "").text == "Qwen answer"
+    failed = feed("qwen", [{"type": "result", "subtype": "error_during_execution", "is_error": True,
+                            "error": {"message": "No auth type is selected"}}])
+    with pytest.raises(RuntimeError, match="No auth type"):
+        failed.reply("qwen", 1, "")
+    for agent in conclave_agents.AGENTS.values():
+        rows = conclave_agents.sprite_frame(agent.sprite, "blink")
+        assert len(rows) == 6 and {len(r) for r in rows} == {7} and "e" not in "".join(rows)
+    lines = conclave.sprite("gemini", "working")
+    assert len(lines) == 7 and {line.cell_len for line in lines} == {14}
+
+
 def test_shell_command_detection():
     assert conclave.looks_like_shell("npm install -g @google/gemini-cli")
     assert conclave.looks_like_shell("git status")
@@ -630,6 +696,10 @@ def test_interactive_session(fake_bin, tmp_path):
     term.command("/show gemini", "GEMINI SAYS go")
     term.command("/continue codex", "Opening Codex", "RESUMED codex-thread-1")
     term.command("/private", "Rounds are private")
+    term.command("/agents", "AGENTS", "Qwen Code", "Ollama")
+    term.command("/agents add qwen", "Qwen Code now advises", "isn't installed yet")
+    term.command("/agents remove qwen", "left the council")
+    term.command("/split always", "splits every task")
     term.command("/model codex gpt-x", "now uses gpt-x")
     term.command("/theme ember", "Theme: ember")
     term.command("/stats", "SESSION", "2 strong")
@@ -726,7 +796,10 @@ def test_app_requires_its_token_and_localhost(app_server):
         assert error.value.code == 403
     info = call(base, "/api/info", app.token)
     assert info["version"] == conclave.__version__
-    assert all(p["installed"] for p in info["providers"])
+    seated = {a["id"]: a for a in info["agents"] if a["id"] in ("claude", *info["advisers"])}
+    assert set(seated) == {"claude", "gemini", "openai"} and all(a["installed"] for a in seated.values())
+    assert {"qwen", "copilot", "opencode", "ollama"} <= {a["id"] for a in info["agents"]}
+    assert len(seated["claude"]["sprites"]["idle"]) == 6
 
 
 def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):
@@ -753,6 +826,19 @@ def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):
     handed = call(base, f"/api/runs/{run['id']}/handoff", app.token, {})
     assert Path(handed["path"]).parent == project / ".conclave"
     assert "--resume abc12345-0000" in handed["command"]
+
+
+def test_app_runs_a_split_round(app_server, monkeypatch):
+    app, base = app_server
+    monkeypatch.setenv("FAKE_PLAN", "1")
+    run = call(base, "/api/runs", app.token, {"question": "Audit it", "split": "always", "advisers": ["gemini", "openai"]})
+    seen = events(base, run["id"], app.token)
+    kinds = [event["type"] for event in seen]
+    assert "mode" in kinds and "plan" in kinds and kinds[-1] == "done"
+    statuses = [e["status"] for e in seen if e["type"] == "subtask"]
+    assert statuses.count("done") == 3
+    result = seen[-1]["result"]
+    assert result["mode"] == "split" and len(result["plan"]) == 3 and "saw subtasks" in result["final"]
 
 
 def test_app_rejects_bad_requests(app_server):

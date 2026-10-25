@@ -18,7 +18,7 @@ conclave = "conclave:main"
 conclave-app = "conclave_app:main"
 
 [tool.setuptools]
-py-modules = ["conclave", "conclave_context", "conclave_app"]
+py-modules = ["conclave", "conclave_agents", "conclave_context", "conclave_app"]
 
 [tool.setuptools.dynamic]
 version = {attr = "conclave.__version__"}

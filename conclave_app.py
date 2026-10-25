@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 import conclave as core
+import conclave_agents as agents
 import conclave_context as context
 
 DEFAULT_PORT = 8765
@@ -90,6 +91,15 @@ class WebView:
     def tokens(self, name: str, tokens_in: int, tokens_out: int) -> None:
         self.run.emit({"type": "tokens", "name": name, "in": tokens_in, "out": tokens_out})
 
+    def set_mode(self, mode: str) -> None:
+        self.run.emit({"type": "mode", "mode": mode})
+
+    def plan(self, subtasks: list[dict]) -> None:
+        self.run.emit({"type": "plan", "subtasks": [{"agent": t["agent"], "title": t["title"]} for t in subtasks]})
+
+    def subtask(self, index: int, status: str, preview: str = "") -> None:
+        self.run.emit({"type": "subtask", "index": index, "status": status, "preview": preview})
+
     def done(self) -> None:
         pass
 
@@ -105,6 +115,9 @@ def outcome(result: core.Round) -> dict:
         "errors": [{"provider": p, "headline": h, "message": m, "fix": core.fix_for(p, m)} for p, h, m in result.errors],
         "meta": core.round_meta(result),
         "sessions": result.sessions,
+        "mode": result.mode,
+        "advisers": list(result.advisers),
+        "plan": [{"agent": t["agent"], "title": t["title"], "ok": "result" in t} for t in result.plan],
         "tokens": [result.tokens_in, result.tokens_out],
         "cost": result.cost,
         "seconds": result.seconds,
@@ -115,11 +128,13 @@ def outcome(result: core.Round) -> dict:
 
 class App:
     def __init__(self, selected: dict[str, str | None], timeout: int, save_sessions: bool = True,
-                 cross_examine: bool = True):
+                 cross_examine: bool = True, advisers: tuple[str, ...] = agents.DEFAULT_ADVISERS, split: str = "auto"):
         self.selected = selected
         self.timeout = timeout
         self.save_sessions = save_sessions
         self.cross_examine = cross_examine
+        self.advisers = tuple(advisers)
+        self.split = split
         self.token = secrets.token_urlsafe(24)
         self.runs: dict[str, Run] = {}
         self.server: ThreadingHTTPServer | None = None
@@ -129,15 +144,19 @@ class App:
             "version": core.__version__,
             "cwd": str(Path.cwd()),
             "theme": core.THEME,
-            "themes": core.THEMES,
+            "themes": {name: {**theme, "colors": core.theme_colors(name)} for name, theme in core.THEMES.items()},
+            "advisers": list(self.advisers),
+            "split": self.split,
             "timeout": self.timeout,
             "saveSessions": self.save_sessions,
             "crossExamine": self.cross_examine,
-            "providers": [
-                {"id": name, "label": core.LABELS[name], "role": core.ROLES[name], "cli": core.PROVIDERS[name],
-                 "installed": bool(shutil.which(core.PROVIDERS[name])), "model": self.selected[name],
-                 "install": core.INSTALL[name]}
-                for name in core.PROVIDERS
+            "agents": [
+                {"id": agent.id, "label": agent.label, "name": agent.name, "cli": agent.binary,
+                 "role": "LEAD" if agent.id == "claude" else "ADVISER", "strengths": agent.strengths,
+                 "installed": bool(shutil.which(agent.binary)), "model": self.selected.get(agent.id),
+                 "install": agent.install, "sessions": bool(agent.resume),
+                 "sprites": {mood: agents.sprite_frame(agent.sprite, mood) for mood in ("idle", "blink", "done", "error", "sleep")}}
+                for agent in core.AGENTS.values()
             ],
         }
 
@@ -179,6 +198,10 @@ class App:
         timeout = int(body.get("timeout") or self.timeout)
         history = [(str(q), str(a)) for q, a in (body.get("history") or [])][-core.MEMORY:]
         save_sessions = bool(body.get("saveSessions", self.save_sessions))
+        advisers = tuple(a for a in (body.get("advisers") or self.advisers) if a in core.AGENTS and a != "claude")
+        if not advisers:
+            raise ValueError("Seat at least one adviser")
+        split = body.get("split") if body.get("split") in ("auto", "always", "never") else self.split
         cross_examine = bool(body.get("crossExamine", self.cross_examine))
         run = Run(project, conversation)
         self.runs[run.id] = run
@@ -187,7 +210,8 @@ class App:
             try:
                 task = core.compose(question, project, conversation, history)
                 result = core.deliberate(task, selected, timeout, WebView(run), cwd=project, control=run.control,
-                                         title=question, save_sessions=save_sessions, cross_examine=cross_examine)
+                                         title=question, save_sessions=save_sessions, cross_examine=cross_examine,
+                                         advisers=advisers, split=split)
                 result.request = question
                 run.result = result
                 run.emit({"type": "done", "result": outcome(result)})
@@ -279,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and parts == ["health"]:
                 return self.send(200, [{"id": h.provider, "installed": h.installed, "signedIn": h.signed_in,
                                         "version": h.version, "detail": h.detail}
-                                       for h in (core.check(name) for name in core.PROVIDERS)])
+                                       for h in (core.check(name) for name in core.AGENTS)])
             if method == "GET" and parts == ["info"]:
                 return self.send(200, self.app.info())
             if method == "GET" and parts == ["projects"]:
@@ -386,8 +410,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     core.apply_theme(settings.theme or "violet")
-    app = App({name: settings.models.get(name) for name in core.PROVIDERS}, args.timeout, settings.save_sessions,
-              settings.cross_examine)
+    app = App({name: settings.models.get(name) for name in core.AGENTS}, args.timeout, settings.save_sessions,
+              settings.cross_examine, settings.advisers, settings.split)
     server = serve(app, args.port or DEFAULT_PORT)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
@@ -643,7 +667,8 @@ details.models summary{cursor:pointer;list-style:none}
 @keyframes breathe{50%{box-shadow:0 0 0 1px color-mix(in srgb,var(--c) 40%,transparent),0 0 30px -6px var(--c)}}
 .card.done{border-color:color-mix(in srgb,var(--c) 55%,transparent)}
 .card.error{border-color:var(--bad)}
-.card .top{display:flex;align-items:center;gap:8px}
+.card .top{display:flex;align-items:center;gap:10px}
+.card .who{display:flex;flex-direction:column;line-height:1.25}
 .card .name{font-weight:800;letter-spacing:.08em;color:var(--c);font-size:13px}
 .card .role{color:var(--muted);font-size:11px;letter-spacing:.14em}
 .badge{margin-left:auto;font:700 10px var(--sans);letter-spacing:.12em;padding:3px 8px;border-radius:6px;background:var(--edge);color:var(--muted)}
@@ -697,7 +722,32 @@ details.opinion{margin:0 16px 12px;border:1px solid var(--edge);border-radius:12
 details.opinion summary{cursor:pointer;padding:10px 14px;font-weight:700;color:var(--c)}
 details.opinion .text{padding:0 18px 14px;font-size:14px}
 .hello{text-align:center;padding:40px 20px;color:var(--muted)}
-.hello svg{width:64px;height:64px;filter:drop-shadow(0 0 24px var(--accent));animation:float 4s ease-in-out infinite}
+.crowd{display:flex;justify-content:center;gap:18px}
+.crowd .sprite{width:56px;height:48px;animation:float 2.6s ease-in-out infinite}
+.crowd .sprite:nth-child(2n){animation-delay:-1.3s}
+.sprite{width:42px;height:36px;flex:none;image-rendering:pixelated;filter:drop-shadow(0 0 8px color-mix(in srgb,var(--c) 45%,transparent))}
+.sprite svg{width:100%;height:100%;display:block;shape-rendering:crispEdges}
+.sprite .blink{opacity:0}
+.working .sprite{animation:bob .64s steps(2,jump-none) infinite}
+.working .sprite .blink{animation:blink 3.4s steps(1) infinite}
+@keyframes bob{50%{transform:translateY(-4px)}}
+@keyframes blink{0%,94%{opacity:0}95%,100%{opacity:1}}
+.card.waiting .sprite{opacity:.55;filter:grayscale(.4)}
+.lineup{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:2px 0 10px;font-size:12px;color:var(--muted)}
+.seat{display:inline-flex;align-items:center;gap:6px;padding:3px 10px 3px 4px;border-radius:999px;border:1px solid var(--edge);background:var(--panel);cursor:pointer;color:var(--muted)}
+.seat .sprite{width:22px;height:19px;filter:none}
+.seat.on{border-color:color-mix(in srgb,var(--c) 70%,transparent);color:var(--text);background:color-mix(in srgb,var(--c) 10%,var(--panel))}
+.seat.absent{opacity:.5}
+.seat.lead{cursor:default}
+.plan{margin:0 16px 12px;border:1px solid var(--edge);border-radius:12px;background:var(--panel2);padding:10px 14px}
+.plan h4{margin:0 0 6px;font-size:11px;letter-spacing:.18em;color:var(--muted)}
+.plan .row{display:grid;grid-template-columns:18px 22px 110px 1fr;gap:8px;align-items:center;padding:4px 0;font-size:13px;color:var(--muted)}
+.plan .row b{color:var(--c);font-size:12px;letter-spacing:.06em}
+.plan .row.working{color:var(--text)}
+.plan .row.working .st{animation:spin 1s linear infinite;display:inline-block}
+.plan .row.done .st{color:var(--good)}
+.plan .row.error .st{color:var(--bad)}
+@keyframes spin{to{transform:rotate(360deg)}}
 @keyframes float{50%{transform:translateY(-6px) rotate(8deg)}}
 .hello h1{font-size:28px;margin:14px 0 6px;color:var(--text);font-weight:750}
 .hello p{max-width:560px;margin:0 auto}
@@ -747,6 +797,7 @@ main,.wrap,.run,.card,.composer{min-width:0}
   <div class="wrap">
     <div class="composer">
       <div class="chips" id="context"></div>
+      <div class="lineup" id="lineup"></div>
       <textarea id="question" placeholder="What should the council look at? For example: why does the build keep failing, and what's the fix?"></textarea>
       <div class="row">
         <button class="quick">Why does this keep failing, and what's the fix?</button>
@@ -758,14 +809,15 @@ main,.wrap,.run,.card,.composer{min-width:0}
         <details class="models"><summary>⚙ Models and timeout</summary>
           <div class="modelgrid" id="modelgrid"></div>
         </details>
-        <label class="toggle" title="Gemini and Codex critique each other's opinions before Claude decides (slower, sharper)"><input type="checkbox" id="cross"> Cross-examine</label>
+        <label class="toggle" title="Whether Claude may split a big task into subtasks for the agents best suited">Split <select class="field" id="split"><option value="auto">auto</option><option value="always">always</option><option value="never">never</option></select></label>
+        <label class="toggle" title="Advisers critique each other's opinions before Claude decides (slower, sharper)"><input type="checkbox" id="cross"> Cross-examine</label>
         <label class="toggle" title="Keep this round as sessions you can continue in Claude Code, Gemini CLI and Codex"><input type="checkbox" id="save"> Save sessions</label>
         <button class="go" id="ask">Ask the council <kbd>⌘↵</kbd></button>
       </div>
     </div>
     <div id="runs"></div>
     <div class="hello" id="hello">
-      <svg viewBox="-1 -1 2 2"><path d="M0,-1 Q0.08,-0.08 1,0 Q0.08,0.08 0,1 Q-0.08,0.08 -1,0 Q-0.08,-0.08 0,-1Z" fill="url(#lg)"/></svg>
+      <div class="crowd" id="crowd"></div>
       <h1>Bring a stuck conversation to the council</h1>
       <p>Claude leads. Gemini and Codex read your project and your Claude Code conversation, give independent opinions, and Claude writes the verdict. Then hand it straight back to Claude Code.</p>
       <div class="steps"><div class="step"><b>1</b>Pick a project</div><div class="step"><b>2</b>Attach a conversation</div><div class="step"><b>3</b>Ask</div><div class="step"><b>4</b>Hand the verdict back</div></div>
@@ -776,9 +828,21 @@ main,.wrap,.run,.card,.composer{min-width:0}
 <div class="toast" id="toast"></div>
 <script>
 const TOKEN = "__TOKEN__";
-const NAMES = {claude: "CLAUDE", gemini: "GEMINI", openai: "CODEX"};
-const ROLES = {claude: "LEAD", gemini: "ADVISER", openai: "ADVISER"};
-const state = {info: null, project: null, conversation: null, convos: [], history: []};
+const state = {info: null, project: null, conversation: null, convos: [], history: [], agents: {}, advisers: []};
+const AG = id => state.agents[id] || {id, label: id.toUpperCase(), name: id, role: "ADVISER", sprites: {}};
+const short = id => AG(id).label.replace(/^\S+\s+/, "");
+
+// A pixel sprite as SVG. Pixels: b body, d darker, a lighter, e eyes, w white, x error eyes.
+function spriteSVG(id, mood) {
+  const frames = AG(id).sprites, body = mood === "error" ? "var(--bad)" : `var(--${id})`;
+  const fill = {b: body, d: `color-mix(in srgb, ${body} 55%, var(--ink))`, a: `color-mix(in srgb, ${body} 45%, white)`,
+                e: "var(--ink)", w: "#fff", x: "#fff"};
+  const layer = (rows, cls) => `<g class="${cls}">` + (rows || []).map((row, y) => [...row].map((p, x) =>
+    fill[p] ? `<rect x="${x}" y="${y}" width="1.02" height="1.02" style="fill:${fill[p]}"/>` : "").join("")).join("") + "</g>";
+  const base = {working: "idle", done: "done", error: "error"}[mood] || "sleep";
+  return `<svg viewBox="0 0 7 6">${layer(frames[base], "base")}${mood === "working" ? layer(frames.blink, "blink") : ""}</svg>`;
+}
+const sprite = (id, mood) => `<div class="sprite" style="--c:var(--${id})">${spriteSVG(id, mood)}</div>`;
 const $ = (s, el = document) => el.querySelector(s);
 const store = {get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } },
                set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} }};
@@ -848,28 +912,48 @@ async function boot() {
   themes.innerHTML = Object.keys(state.info.themes).map(n => `<option>${n}</option>`).join("");
   themes.value = store.get("theme", state.info.theme); applyTheme(themes.value);
   themes.onchange = () => applyTheme(themes.value);
-  $("#pills").innerHTML = state.info.providers.map(p =>
-    `<div class="pill ${p.installed ? "" : "missing"}" data-id="${p.id}" title="${esc(p.installed ? p.cli + " is installed" : p.install)}"><i></i><b>${esc(NAMES[p.id])}</b>${esc(p.model || "default")}</div>`).join("");
+  state.info.agents.forEach(a => state.agents[a.id] = a);
+  state.advisers = store.get("advisers", state.info.advisers).filter(a => state.agents[a] && a !== "claude");
+  if (!state.advisers.length) state.advisers = state.info.advisers;
+  $("#split").value = store.get("split", state.info.split);
+  $("#split").onchange = () => store.set("split", $("#split").value);
+  renderCouncil();
   const saved = store.get("models", {});
-  $("#modelgrid").innerHTML = state.info.providers.map(p =>
-    `<label>${esc(NAMES[p.id])}<input class="field" data-model="${p.id}" placeholder="${esc(p.model || "provider default")}" value="${esc(saved[p.id] || "")}"></label>`).join("")
+  $("#modelgrid").innerHTML = state.info.agents.map(p =>
+    `<label>${esc(short(p.id))}<input class="field" data-model="${p.id}" placeholder="${esc(p.model || "provider default")}" value="${esc(saved[p.id] || "")}"></label>`).join("")
     + `<label>TIMEOUT (s)<input class="field" id="timeout" type="number" min="10" value="${store.get("timeout", state.info.timeout)}"></label>`;
   $("#modelgrid").oninput = () => { const m = {}; document.querySelectorAll("[data-model]").forEach(e => m[e.dataset.model] = e.value.trim());
     store.set("models", m); store.set("timeout", +$("#timeout").value || state.info.timeout); };
   $("#save").checked = store.get("saveSessions", state.info.saveSessions);
   $("#cross").checked = store.get("crossExamine", state.info.crossExamine);
   $("#cross").onchange = () => store.set("crossExamine", $("#cross").checked);
-  api("/api/health").then(report => report.forEach(h => {
-    const pill = $(`#pills .pill[data-id="${h.id}"]`); if (!pill) return;
-    pill.classList.toggle("missing", !h.installed); pill.classList.toggle("unsigned", h.installed && h.signedIn === false);
-    pill.title = !h.installed ? h.detail : h.signedIn === false ? h.detail : `${h.version || "installed"} · signed in`;
-  })).catch(() => {});
+  api("/api/health").then(report => { state.health = Object.fromEntries(report.map(h => [h.id, h])); renderCouncil(); }).catch(() => {});
   $("#save").onchange = () => store.set("saveSessions", $("#save").checked);
   await loadProjects();
   const last = store.get("project", null);
   const pick = last && state.projects.find(p => p.path === last) ? last : (state.projects.find(p => p.path === state.info.cwd) ? state.info.cwd : null);
   if (pick) selectProject(pick);
   renderContext();
+}
+
+// The pills in the header, the seat chips under the question, and the sprites on the welcome screen.
+function renderCouncil() {
+  const members = ["claude", ...state.advisers], health = state.health || {};
+  $("#pills").innerHTML = members.map(id => { const a = AG(id), h = health[id] || {installed: a.installed};
+    const cls = !h.installed ? "missing" : h.signedIn === false ? "unsigned" : "";
+    const tip = !h.installed ? a.install : h.signedIn === false ? h.detail : `${h.version || a.cli} · ${a.strengths}`;
+    return `<div class="pill ${cls}" data-id="${id}" title="${esc(tip)}"><i></i><b>${esc(short(id))}</b>${esc(a.model || "default")}</div>`; }).join("");
+  $("#lineup").innerHTML = `<span>Council:</span>` + state.info.agents.map(a => {
+    const seated = a.id === "claude" || state.advisers.includes(a.id);
+    return `<span class="seat ${seated ? "on" : ""} ${a.installed ? "" : "absent"} ${a.id === "claude" ? "lead" : ""}" data-seat="${a.id}" style="--c:var(--${a.id})"
+      title="${esc(a.name + ": " + a.strengths + (a.installed ? "" : " · not installed: " + a.install))}">${sprite(a.id, seated ? "done" : "sleep")}${esc(short(a.id))}</span>`; }).join("");
+  $("#lineup").querySelectorAll("[data-seat]").forEach(el => el.onclick = () => {
+    const id = el.dataset.seat; if (id === "claude") return;
+    if (state.advisers.includes(id)) { if (state.advisers.length === 1) return toast("The council needs at least one adviser");
+      state.advisers = state.advisers.filter(a => a !== id); }
+    else { state.advisers = [...state.advisers, id]; if (!AG(id).installed) toast(`${AG(id).name} isn't installed yet: ${AG(id).install}`); }
+    store.set("advisers", state.advisers); renderCouncil(); });
+  const crowd = $("#crowd"); if (crowd) crowd.innerHTML = members.map(id => sprite(id, "done")).join("");
 }
 
 async function loadProjects() {
@@ -917,8 +1001,8 @@ function renderContext() {
 }
 
 function card(name, model) {
-  return `<div class="card" data-name="${name}" style="--c:var(--${name})">
-    <div class="top"><span class="name">${name === "claude" ? "✦" : name === "gemini" ? "✧" : "✳"} ${NAMES[name]}</span><span class="role">${ROLES[name]}</span><span class="badge">STANDBY</span></div>
+  return `<div class="card waiting" data-name="${name}" style="--c:var(--${name})">
+    <div class="top">${sprite(name, "sleep")}<span class="who"><span class="name">${esc(AG(name).label)}</span><span class="role">${AG(name).role}</span></span><span class="badge">STANDBY</span></div>
     <div class="track"></div><div class="stage">standing by</div><div class="activity"></div>
     <div class="body"><div class="inner"></div></div>
     <div class="foot"><span class="model">${esc(model || "provider default")}</span><span class="tok"></span><span class="time"></span></div></div>`;
@@ -929,25 +1013,29 @@ async function ask() {
   if (!question) { $("#question").focus(); return; }
   const models = store.get("models", {}), timeout = store.get("timeout", state.info.timeout);
   let id;
+  const advisers = [...state.advisers], split = $("#split").value;
   try { id = (await api("/api/runs", {question, project: state.project, conversation: state.conversation, models, timeout, history: state.history.slice(-3),
-    saveSessions: $("#save").checked, crossExamine: $("#cross").checked})).id; }
+    saveSessions: $("#save").checked, crossExamine: $("#cross").checked, advisers, split})).id; }
   catch (e) { toast(e.message); return; }
   $("#hello")?.remove(); $("#question").value = "";
   const conv = state.convos.find(c => c.id === state.conversation);
   const el = document.createElement("section"); el.className = "run";
-  const providers = Object.fromEntries(state.info.providers.map(p => [p.id, models[p.id] || p.model]));
+  const providers = Object.fromEntries(state.info.agents.map(p => [p.id, models[p.id] || p.model]));
   el.innerHTML = `<div class="runhead"><h2>${esc(question)}</h2><span class="clock">0:00</span><button class="btn" data-act="cancel">Cancel</button></div>
     <div class="chips" style="padding:10px 20px 0">${state.project ? `<span class="chip">⌂ <span>${esc(state.project.split("/").pop())}</span></span>` : ""}${conv ? `<span class="chip">❝ <span>${esc(conv.title)}</span></span>` : ""}</div>
-    <div class="tracker">${phaseList($("#cross").checked).map(([k, label], i) => `${i ? '<span class="bar"></span>' : ""}<span class="ph" data-ph="${k}">${i ? "○" : "◉"} ${label}</span>`).join("")}</div>
-    <div class="cards">${["claude", "gemini", "openai"].map(n => card(n, providers[n])).join("")}</div>
+    <div class="tracker">${trackerHTML(phaseList($("#cross").checked && advisers.length > 1))}</div>
+    <div class="planbox"></div>
+    <div class="cards" style="grid-template-columns:repeat(${Math.min(advisers.length + 1, 4)},1fr)">${["claude", ...advisers].map(n => card(n, providers[n])).join("")}</div>
     <div class="problems"></div>
     <div class="verdict"><div class="in"><h3><span class="wordmark">✦ VERDICT</span><span class="drafting">DRAFTING…</span></h3><div class="text"></div><div class="meterbox"></div></div></div>
     <div class="actions"></div><div class="continue"></div><div class="opinions"></div>`;
   $("#runs").prepend(el);
-  follow(id, el, question, $("#cross").checked);
+  follow(id, el, question, $("#cross").checked && advisers.length > 1);
 }
 
 const phaseList = cross => [["brief", "BRIEF"], ["advise", "DELIBERATION"], ...(cross ? [["cross", "CROSS-EXAM"]] : []), ["verdict", "VERDICT"]];
+const SPLIT_PHASES = [["brief", "PLAN"], ["work", "SUBTASKS"], ["verdict", "VERDICT"]];
+const trackerHTML = list => list.map(([k, label], i) => `${i ? '<span class="bar"></span>' : ""}<span class="ph" data-ph="${k}">${i ? "○" : "◉"} ${label}</span>`).join("");
 
 function follow(id, el, question, cross) {
   const run = {phase: "brief", started: Date.now(), cards: {}, done: false, tokens: {}};
@@ -956,7 +1044,8 @@ function follow(id, el, question, cross) {
     if (!run.done) el.querySelector(".clock").textContent = clock((Date.now() - run.started) / 1000);
     for (const [n, c] of Object.entries(run.cards)) if (c.start && !c.end) cardEl(n).querySelector(".time").textContent = clock((Date.now() - c.start) / 1000);
   }, 250);
-  const phases = [...phaseList(cross).map(p => p[0]), "done"];
+  let phases = [...phaseList(cross).map(p => p[0]), "done"];
+  const mood = (n, m) => { const box = cardEl(n)?.querySelector(".sprite"); if (box) box.innerHTML = spriteSVG(n, m); };
   const setPhase = p => { run.phase = p; const at = phases.indexOf(p);
     el.querySelectorAll(".ph").forEach((ph, i) => { ph.className = "ph" + (i < at ? " on" : i === at ? " now" : "");
       ph.textContent = (i < at ? "✓ " : i === at ? "◉ " : "○ ") + ph.textContent.slice(2); });
@@ -966,7 +1055,13 @@ function follow(id, el, question, cross) {
   events.onmessage = msg => {
     const e = JSON.parse(msg.data), c = e.name && cardEl(e.name);
     if (e.type === "phase") setPhase(e.phase);
-    if (e.type === "start") { run.cards[e.name] = {start: Date.now()}; c.className = "card working"; c.querySelector(".badge").textContent = "● THINKING";
+    if (e.type === "mode" && e.mode === "split") { phases = [...SPLIT_PHASES.map(p => p[0]), "done"];
+      el.querySelector(".tracker").innerHTML = trackerHTML(SPLIT_PHASES); setPhase(run.phase); }
+    if (e.type === "plan") el.querySelector(".planbox").innerHTML = `<div class="plan"><h4>✦ CLAUDE'S PLAN</h4>` + e.subtasks.map((t, i) =>
+      `<div class="row" data-sub="${i}" style="--c:var(--${t.agent})"><span>${i + 1}</span><span class="st">○</span><b>${esc(short(t.agent))}</b><span>${esc(t.title)}</span></div>`).join("") + "</div>";
+    if (e.type === "subtask") { const row = el.querySelector(`[data-sub="${e.index}"]`);
+      if (row) { row.className = "row " + e.status; row.querySelector(".st").textContent = {working: "◌", done: "✓", error: "✗"}[e.status] || "○"; row.title = e.preview || ""; } }
+    if (e.type === "start") { run.cards[e.name] = {start: Date.now()}; c.className = "card working"; c.querySelector(".badge").textContent = "● THINKING"; mood(e.name, "working");
       c.querySelector(".stage").textContent = e.stage; c.querySelector(".activity").textContent = e.activity || "";
       c.querySelector(".inner").innerHTML = e.preview ? md(e.preview) : ""; }
     if (e.type === "stream") {
@@ -974,8 +1069,8 @@ function follow(id, el, question, cross) {
       if (e.name === "claude" && run.phase === "verdict") el.querySelector(".verdict .text").innerHTML = md(drafting(e.text)) + '<span class="cursor" style="--c:var(--accent)"></span>';
       else { c.querySelector(".inner").innerHTML = md(e.name === "claude" ? drafting(e.text) : e.text) + '<span class="cursor"></span>';
         if (!run.tokens[e.name] && e.text) c.querySelector(".tok").textContent = "~" + count(Math.round(e.text.length / 4)) + " tok"; } }
-    if (e.type === "finish") { run.cards[e.name].end = Date.now(); c.className = "card " + e.status;
-      c.querySelector(".badge").textContent = e.status === "done" ? "✓ DONE" : "✗ FAILED"; c.querySelector(".stage").textContent = e.stage;
+    if (e.type === "finish") { if (run.cards[e.name]) run.cards[e.name].end = Date.now(); c.className = "card " + e.status; mood(e.name, e.status);
+      c.querySelector(".badge").textContent = {done: "✓ DONE", error: "✗ FAILED"}[e.status] || "STANDBY"; c.querySelector(".stage").textContent = e.stage;
       c.querySelector(".activity").textContent = ""; c.querySelector(".inner").innerHTML = e.status === "error" ? `<span class="err">${esc(e.preview)}</span>` : md(e.preview); }
     if (e.type === "tokens") { const t = run.tokens[e.name] || [0, 0]; run.tokens[e.name] = [t[0] + e.in, t[1] + e.out];
       c.querySelector(".tok").textContent = `↑${count(run.tokens[e.name][0])} ↓${count(run.tokens[e.name][1])}`; }
@@ -1013,18 +1108,19 @@ function finish(el, e, question) {
       box.innerHTML = `Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue the Claude Code conversation with the verdict:<pre>${esc(h.command)}</pre>`;
       navigator.clipboard.writeText(h.command).then(() => toast("Command copied — paste it in Terminal"), () => {});
     } catch (err) { toast(err.message); } };
-  const tools = {claude: ["✦", "Claude Code"], gemini: ["✧", "Gemini CLI"], openai: ["✳", "Codex"]};
-  const saved = Object.keys(tools).filter(n => r.sessions && r.sessions[n]);
+  const saved = Object.keys(r.sessions || {});
   const cont = el.querySelector(".continue");
   if (saved.length) {
-    cont.innerHTML = `<span>↪ Continue in:</span>` + saved.map(n => `<button class="btn" style="--c:var(--${n})" data-tool="${n}"><b>${tools[n][0]}</b> ${tools[n][1]}</button>`).join("");
+    cont.innerHTML = `<span>↪ Continue in:</span>` + saved.map(n => `<button class="btn" style="--c:var(--${n})" data-tool="${n}"><b>${esc(AG(n).label.split(" ")[0])}</b> ${esc(AG(n).name)}</button>`).join("");
     cont.querySelectorAll("[data-tool]").forEach(b => b.onclick = async () => {
       try { const res = await api(`/api/runs/${el.dataset.run}/continue`, {provider: b.dataset.tool});
-        if (res.opened) toast(`Opened in Terminal: ${tools[b.dataset.tool][1]}`);
+        if (res.opened) toast(`Opened in Terminal: ${AG(b.dataset.tool).name}`);
         else navigator.clipboard.writeText(res.command).then(() => toast("Command copied: paste it in a terminal"), () => toast(res.command));
       } catch (err) { toast(err.message); } });
   }
-  el.querySelector(".opinions").innerHTML = [["brief", "claude", "✦ CLAUDE · BRIEF", r.brief], ...Object.entries(r.opinions).map(([n, t]) => [n, n, `${n === "gemini" ? "✧" : "✳"} ${NAMES[n]} · OPINION`, t])]
+  const split = r.mode === "split";
+  el.querySelector(".opinions").innerHTML = [["brief", "claude", split ? "✦ CLAUDE · PLAN" : "✦ CLAUDE · BRIEF", r.brief],
+    ...Object.entries(r.opinions).map(([n, t]) => [n, n, `${AG(n).label} · ${split ? "SUBTASKS" : "OPINION"}`, t])]
     .filter(x => x[3]).map(([, n, title, t]) => `<details class="opinion" style="--c:var(--${n})"><summary>${esc(title)}</summary><div class="text">${md(t)}</div></details>`).join("");
   state.history.push([question, r.final]); renderContext();
 }
