@@ -53,9 +53,9 @@ To update, run `conclave update`. It reinstalls the latest version from where yo
 conclave --app
 ```
 
-This opens Conclave in your browser, drawn the way the terminal is: monospace, frames with their titles set into the border, the block-letter banner, and each agent's box in its maker's colours. The sidebar lists every project you have used Claude Code in, and each project's conversations show how many errors they hit. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, as in the terminal: Claude in clay with rounded corners, Gemini blue with a double frame, ChatGPT green and square. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
+This opens Conclave in your browser: a quiet, monospace page where each agent's box carries a thin line of its maker's colour. The sidebar lists every project you have used Claude Code in, and each project's conversations show how many errors they hit. Pick a conversation, ask a question (or use one of the quick prompts such as "Why does this keep failing, and what's the fix?"), and watch the models work live. Each agent works in its own box, as in the terminal: Claude in clay with rounded corners, Gemini blue with a double frame, ChatGPT green and square. Each box shows the model it's running, what it is doing (reading a file, running a test) and its answer as it writes.
 
-**Send to** picks who gets the question: the whole council, or one agent. With one agent you also choose its access (**Read**, **Edit** or **Full**, explained below), and follow-ups carry on that agent's conversation.
+**Models** has a field for each agent in play: type any model, or pick one from its list. The list holds Claude's `opus`, `sonnet` and `haiku`, the models Antigravity and Ollama say they have, and any model an agent has reported or is set to in its own settings. Leave a field empty for that tool's default. **Send to** picks who gets the question: the whole council, or one agent. With one agent you also choose its access (**Read**, **Edit** or **Full**, explained below), and follow-ups carry on that agent's conversation.
 
 When the verdict is in, the app shows:
 

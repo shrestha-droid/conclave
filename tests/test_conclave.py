@@ -777,6 +777,12 @@ def test_access_levels_and_resumed_sessions():
     assert 'sandbox_mode="workspace-write"' in codex and "--sandbox" not in codex
 
 
+def test_model_choices_come_from_each_tool(fake_bin, tmp_path, monkeypatch):
+    install(fake_bin, "ollama", 'print("NAME            ID      SIZE\\nllama3.2:latest  a80c   2.0 GB\\nqwen2.5-coder:7b  b1    4.7 GB")')
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    assert conclave.model_choices("ollama")[:2] == ["llama3.2:latest", "qwen2.5-coder:7b"]
+
+
 def test_models_are_shown_from_settings_and_streams(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
@@ -984,6 +990,8 @@ def test_app_requires_its_token_and_localhost(app_server):
     assert set(seated) == {"claude", "gemini", "openai"} and all(a["installed"] for a in seated.values())
     assert {"qwen", "copilot", "opencode", "ollama"} <= {a["id"] for a in info["agents"]}
     assert len(seated["claude"]["sprites"]["idle"]) == 6
+    models = call(base, "/api/models", app.token)
+    assert models["claude"][:3] == ["opus", "sonnet", "haiku"] and set(models) == set(conclave.AGENTS)
 
 
 def test_app_runs_a_round_with_a_conversation(app_server, tmp_path):

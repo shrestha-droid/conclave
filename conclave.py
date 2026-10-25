@@ -377,6 +377,28 @@ def configured_model(agent: str) -> str:
     return ""
 
 
+# Claude Code takes these aliases for its current models; other tools list theirs (see model_choices).
+MODEL_ALIASES = {"claude": ("opus", "sonnet", "haiku")}
+
+
+def model_choices(agent: str) -> list[str]:
+    """Models to offer for an agent: Claude's aliases, what its tool lists (Antigravity's `agy models`, Ollama's
+    `ollama list`), and the models it has reported or is configured with."""
+    found = list(MODEL_ALIASES.get(agent, ()))
+    command = ["ollama", "list"] if agent == "ollama" else None
+    if agent == "gemini" and AGENTS["gemini"].reader == "antigravity":
+        command = ["agy", "models"]
+    if command and shutil.which(command[0]):
+        listed = quiet(command, timeout=10)
+        for line in (listed.stdout if listed and listed.returncode == 0 else "").splitlines():
+            word = (line.split() or [""])[0].strip("*•-")
+            # Model ids have a dash, dot or digit (llama3.2, gemini-4-pro); header and prose words don't.
+            if re.fullmatch(r"[A-Za-z0-9][\w.:/-]*", word) and re.search(r"[-.\d]", word):
+                found.append(word)
+    found += [model for model in (SEEN_MODELS.get(agent), configured_model(agent)) if model]
+    return list(dict.fromkeys(found))
+
+
 def model_for(agent: str, selected: dict[str, str | None]) -> str:
     """The model to show for an agent: the one Conclave was told to use, else the one its CLI last reported, else
     its tool's own setting."""

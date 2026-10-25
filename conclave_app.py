@@ -9,6 +9,7 @@ answers requests that carry the token embedded in the page it serves, and only f
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import plistlib
@@ -166,6 +167,11 @@ class App:
                 for agent in core.AGENTS.values()
             ],
         }
+
+    def models(self) -> dict[str, list[str]]:
+        """Models to suggest for each agent. Listing them runs some of the tools, so they're asked at once."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            return dict(zip(core.AGENTS, pool.map(core.model_choices, core.AGENTS)))
 
     def projects(self) -> list[dict]:
         listed = [{"path": folder, "name": Path(folder).name or folder, "when": context.ago(updated), "count": total,
@@ -334,6 +340,8 @@ class Handler(BaseHTTPRequestHandler):
                                        for h in (core.check(name) for name in core.AGENTS)])
             if method == "GET" and parts == ["info"]:
                 return self.send(200, self.app.info())
+            if method == "GET" and parts == ["models"]:
+                return self.send(200, self.app.models())
             if method == "GET" and parts == ["projects"]:
                 return self.send(200, self.app.projects())
             if method == "GET" and parts == ["conversations"]:
@@ -625,309 +633,265 @@ PAGE = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#0A0A0C;--panel:#0D0D11;--panel2:#141418;--edge:#1E1E24;--edge2:#2A2A30;--accent:#E50914;--accent2:#FF6B73;--muted:#85837D;
---text:#EEEBE4;--soft:#B9B6AE;--good:#4ADE80;--warn:#FFB547;--bad:#FF9F43;--g1:#EEEBE4;--g2:#EEEBE4;--g3:#B9B6AE;
+:root{--ink:#0A0A0C;--panel:#0D0D11;--panel2:#121216;--edge:#1B1B20;--edge2:#26262C;--accent:#E50914;--accent2:#FF6B73;--muted:#77756F;
+--text:#E6E3DC;--soft:#A9A69F;--good:#4ADE80;--warn:#FFB547;--bad:#FF9F43;
 --claude:#D97757;--gemini:#4F8FF7;--openai:#10A37F;--qwen:#7C6CF2;--copilot:#A371F7;--opencode:#FAB283;--ollama:#E5E5E5;
 --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--ink);color:var(--text);font:13px/1.55 var(--mono)}
+html,body{margin:0;height:100%;background:var(--ink);color:var(--soft);font:13px/1.6 var(--mono)}
 button,input,textarea,select{font:inherit;color:inherit}
-a{color:var(--accent2)}
-::selection{background:color-mix(in srgb,var(--accent) 45%,transparent)}
-.app{display:grid;grid-template-columns:330px 1fr;grid-template-rows:auto 1fr;height:100vh}
+a{color:var(--text)}
+::selection{background:color-mix(in srgb,var(--accent) 35%,transparent)}
+.app{display:grid;grid-template-columns:280px 1fr;grid-template-rows:auto 1fr;height:100vh}
 .dim{color:var(--muted)}
+.label{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:lowercase;margin:0 0 8px}
 
-/* Panels drawn the way the terminal draws them: a frame with its title set into the top edge and its footer
-   into the bottom edge. .brk is the corner-bracket box; .frame is a full border. */
-.panel{position:relative;--ground:var(--ink);background:var(--ground);padding:20px 18px 16px;margin-top:10px}
-.panel.frame{border:1px solid var(--edge2)}
-.panel.brk{background:
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) top left/12px 1px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) top left/1px 12px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) top right/12px 1px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) top right/1px 12px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) bottom left/12px 1px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) bottom left/1px 12px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) bottom right/12px 1px no-repeat,
- linear-gradient(var(--bc,var(--edge2)),var(--bc,var(--edge2))) bottom right/1px 12px no-repeat,var(--ground)}
-.ttl{position:absolute;top:-.8em;left:14px;padding:0 6px;background:var(--ground);white-space:nowrap;max-width:calc(100% - 28px);overflow:hidden;text-overflow:ellipsis;font-weight:700;letter-spacing:.04em}
-.ttl .br{color:var(--accent)}
-.sub{position:absolute;bottom:-.8em;right:14px;padding:0 6px;background:var(--ground);color:var(--muted);white-space:nowrap;font-size:12px}
-.lbl{font-weight:700;letter-spacing:.06em}
-
-header{grid-column:1/-1;display:flex;align-items:center;gap:16px;padding:10px 20px;border-bottom:1px solid var(--edge)}
-.logo{font-weight:800;letter-spacing:.04em;white-space:nowrap}
+header{grid-column:1/-1;display:flex;align-items:center;gap:20px;padding:12px 22px;border-bottom:1px solid var(--edge)}
+.logo{color:var(--text);font-weight:500;white-space:nowrap}
 .logo i{color:var(--accent);font-style:normal}
-.tagline{color:var(--muted);white-space:nowrap}
 .spacer{flex:1}
-.pills{display:flex;gap:14px;flex-wrap:wrap}
-.pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
-.pill i{width:7px;height:7px;background:var(--good)}
-.pill.missing i{background:var(--bad)}
-.pill.unsigned i{background:var(--warn)}
-.pill b{color:var(--c);font-weight:700}
-.iconbtn{border:1px solid var(--edge2);background:var(--ink);padding:4px 10px;cursor:pointer;color:var(--soft)}
-.iconbtn:hover,.btn:hover{border-color:var(--accent);color:var(--text)}
+.pills{display:flex;gap:16px;font-size:12px;min-width:0;overflow:hidden}
+.pill{display:flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap}
+.pill i{width:5px;height:5px;border-radius:50%;background:var(--c)}
+.pill.missing i{background:var(--edge2)}
+.pill b{color:var(--soft);font-weight:400}
+.iconbtn{border:0;background:none;padding:2px 4px;cursor:pointer;color:var(--muted)}
+.iconbtn:hover{color:var(--text)}
 
-aside{border-right:1px solid var(--edge);overflow:auto;padding:16px 14px 30px;display:flex;flex-direction:column;gap:22px}
+
+aside{border-right:1px solid var(--edge);overflow:auto;padding:20px 14px 30px;display:flex;flex-direction:column;gap:26px}
 .list{display:flex;flex-direction:column}
-.item{padding:6px 8px;cursor:pointer;display:grid;grid-template-columns:22px 1fr;gap:0 4px}
-.item .n{color:var(--muted)}
-.item:hover{background:var(--panel2)}
-.item.on{background:color-mix(in srgb,var(--accent) 10%,var(--ink))}
-.item.on .n,.item.on .t{color:var(--accent);font-weight:700}
+.item{padding:5px 8px;cursor:pointer;border-left:1px solid transparent}
+.item:hover{color:var(--text)}
+.item.on{border-left-color:var(--accent);color:var(--text)}
+.item .n{display:none}
 .item .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.item .s{grid-column:2;color:var(--muted);font-size:11.5px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item .s{color:var(--muted);font-size:11px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .err{color:var(--bad)}
-.field{width:100%;padding:6px 9px;border:1px solid var(--edge2);background:var(--ink);outline:none;border-radius:0}
-.field:focus{border-color:var(--accent)}
-.empty{color:var(--muted);font-size:12px;padding:6px 8px}
+.field{width:100%;padding:6px 8px;border:1px solid var(--edge);background:transparent;outline:none;border-radius:0}
+.field:focus{border-color:var(--edge2)}
+.empty{color:var(--muted);font-size:12px;padding:4px 8px}
+select.field{width:auto;border:0;background:none;color:var(--muted);padding:0;cursor:pointer;-webkit-appearance:none;appearance:none}
+#minds{white-space:nowrap}
 
-main{overflow:auto;padding:18px 26px 70px}
-.wrap{max-width:1240px;margin:0 auto;display:flex;flex-direction:column;gap:24px}
-.chips{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px}
+main{overflow:auto;padding:28px 34px 80px}
+.wrap{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:30px}
+.hello h1{font:500 18px/1.4 var(--mono);color:var(--text);margin:0 0 6px}
+.hello h1 i{color:var(--accent);font-style:normal}
+.hello p{margin:0;color:var(--muted);max-width:640px}
+
+.composer{border:1px solid var(--edge);padding:16px 18px}
+.chips{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px;font-size:12px}
 .chip{display:inline-flex;align-items:center;gap:6px;color:var(--muted);max-width:100%}
 .chip span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chip.live{color:var(--accent)}
-.chip.live span{color:var(--text)}
+.chip.live span{color:var(--soft)}
 .chip button{border:0;background:none;color:var(--muted);cursor:pointer;padding:0}
-.chip button:hover{color:var(--accent)}
-.sendto,.lineup{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:4px 0 10px}
-.dest,.seat{display:inline-flex;align-items:center;gap:6px;padding:2px 9px 2px 4px;border:1px solid var(--edge2);background:var(--ink);cursor:pointer;color:var(--muted);font-weight:700}
-.dest .sprite,.seat .sprite{width:21px;height:18px}
-.dest:hover,.seat:hover{color:var(--text)}
-.dest.on{color:var(--ground,var(--ink));background:var(--c);border-color:var(--c)}
-.dest.on .sprite{filter:brightness(.15)}
-.dest.council{padding-left:9px}
-.dest.council.on{--c:var(--accent);color:#fff}
-.seat.on{border-color:var(--c);color:var(--c)}
+.chip button:hover{color:var(--text)}
+.tabs{display:flex;gap:4px 16px;flex-wrap:wrap;align-items:baseline;margin-bottom:10px}
+.tabs .k{color:var(--muted);font-size:11px;width:56px}
+.dest,.seat{cursor:pointer;color:var(--muted);border-bottom:1px solid transparent;padding-bottom:1px}
+.dest:hover,.seat:hover{color:var(--soft)}
+.dest.on{color:var(--c);border-bottom-color:var(--c)}
+.dest.council.on{--c:var(--text)}
+.seat.on{color:var(--c)}
+.seat.on::before{content:"● ";font-size:9px;vertical-align:1px}
+.seat:not(.on)::before{content:"○ ";font-size:9px;vertical-align:1px}
 .dest.absent,.seat.absent{opacity:.45}
 .seat.lead{cursor:default}
-.prompt{display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--edge);border-bottom:1px solid var(--edge);padding:10px 0;margin-top:6px}
-.tag{flex:none;background:var(--accent);color:#fff;font-weight:800;padding:1px 8px;white-space:nowrap}
-.tag.to{background:var(--c);color:var(--ground)}
-.tag.acc{background:none;color:var(--warn);padding:1px 0}
+.models{display:flex;gap:6px 20px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
+.models .k{color:var(--muted);font-size:11px;width:56px}
+.mdl{display:inline-flex;align-items:baseline;gap:6px}
+.mdl span{color:var(--c)}
+.mdl input{width:auto;min-width:9ch;border:0;border-bottom:1px dashed var(--edge2);background:transparent;padding:0 2px;outline:none;color:var(--soft)}
+.mdl input:focus{border-bottom-color:var(--c);color:var(--text)}
+.mdl input::placeholder{color:var(--muted)}
+.prompt{display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--edge);padding-top:12px;margin-top:10px}
+.arrow{color:var(--accent)}
+.tag{display:none}
+.tag.to{display:inline;color:var(--c)}
+.tag.acc{display:inline;color:var(--warn)}
 .tag.acc.full{color:var(--accent)}
-.arrow{color:var(--accent);font-weight:800}
-textarea{flex:1;min-height:84px;resize:vertical;border:0;outline:none;background:transparent;line-height:1.55}
+textarea{flex:1;min-height:78px;resize:vertical;border:0;outline:none;background:transparent;line-height:1.6;color:var(--text)}
 textarea::placeholder{color:var(--muted)}
-.row{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;margin-top:10px}
+.row{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;margin-top:8px;font-size:12px}
 .quick{border:0;background:none;padding:0;color:var(--muted);cursor:pointer;text-align:left}
-.quick::before{content:"› ";color:var(--accent)}
-.quick:hover{color:var(--text)}
-.access{display:inline-flex;gap:0;align-items:center}
-.access .k{color:var(--muted);margin-right:6px}
-.access button{border:1px solid var(--edge2);background:var(--ink);padding:1px 9px;cursor:pointer;color:var(--muted);font-weight:700}
-.access button+button{border-left:0}
-.access button.on[data-level=read]{color:var(--text);background:var(--panel2)}
-.access button.on[data-level=edit]{color:#000;background:var(--warn);border-color:var(--warn)}
-.access button.on[data-level=full]{color:#fff;background:var(--accent);border-color:var(--accent)}
-.access.off{opacity:.4;pointer-events:none}
-.go{margin-left:auto;border:0;padding:5px 14px;font-weight:800;cursor:pointer;color:#fff;background:var(--accent)}
-.go:hover{filter:brightness(1.12)}
-.go kbd{font:inherit;opacity:.75;margin-left:8px}
-details.models summary{cursor:pointer;list-style:none;color:var(--muted)}
-details.models summary::before{content:"⚙ "}
-.modelgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px 12px;margin-top:8px}
-.modelgrid label{display:flex;flex-direction:column;gap:3px;font-size:12px}
-select.field{width:auto;padding:2px 6px}
+.quick:hover{color:var(--soft)}
+.access{display:inline-flex;gap:10px;align-items:center}
+.access .k{color:var(--muted)}
+.access button{border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
+.access button.on{color:var(--text);text-decoration:underline;text-underline-offset:4px}
+.access button.on[data-level=edit]{color:var(--warn)}
+.access button.on[data-level=full]{color:var(--accent)}
+.access.off{display:none}
+.go{margin-left:auto;border:1px solid var(--edge2);background:none;padding:4px 14px;cursor:pointer;color:var(--text)}
+.go:hover{border-color:var(--accent)}
+.go kbd{font:inherit;color:var(--muted);margin-left:8px}
+details.options summary{cursor:pointer;list-style:none;color:var(--muted)}
+details.options[open] summary{color:var(--soft)}
+details.options .row{margin-top:8px}
+details.options input[type=number]{width:7ch;border:0;border-bottom:1px dashed var(--edge2);background:none;outline:none;padding:0 2px}
 .toggle{display:flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer}
-.toggle input{accent-color:var(--accent)}
+.toggle input[type=checkbox]{accent-color:var(--soft)}
 
-/* A round: the dashboard from the terminal */
 .run{animation:rise .3s ease}
-@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
-.runhead{display:flex;gap:16px;align-items:flex-start}
-.runhead h2{margin:2px 0 0;font:700 14px/1.5 var(--mono);flex:1;white-space:pre-wrap}
-.clock{color:var(--accent);font-weight:700;white-space:nowrap}
-.tracker{display:flex;align-items:center;gap:10px;margin:14px 0 4px;flex-wrap:wrap;color:var(--edge2);font-weight:600}
-.tracker .bar{flex:0 1 60px;min-width:16px;height:1px;background:var(--edge2)}
-.tracker .bar.on{background:var(--accent)}
-.tracker .ph{color:var(--muted)}
-.tracker .ph .n{color:var(--edge2);margin-right:6px}
-.tracker .ph.on{color:var(--soft)}
-.tracker .ph.on::after{content:" ✓";color:var(--good)}
-.tracker .ph.now{color:var(--text);font-weight:800}
-.tracker .ph.now .n{color:var(--accent)}
-.tracker .ph.now::before{content:"▸ ";color:var(--accent)}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:14px}
-.card{--c2:var(--c);--ground:var(--panel2);position:relative;border:1px solid color-mix(in srgb,var(--c) 70%,var(--edge));background:var(--ground);padding:22px 16px 18px;min-height:170px;display:flex;flex-direction:column;gap:8px;transition:border-color .3s}
-.card .ttl{background:var(--ground)}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.runhead{display:flex;gap:16px;align-items:baseline}
+.runhead h2{margin:0;font:500 14px/1.5 var(--mono);color:var(--text);flex:1;white-space:pre-wrap}
+.runmeta{display:flex;gap:16px;color:var(--muted);font-size:12px;margin-top:4px;flex-wrap:wrap}
+.clock{color:var(--muted)}
+.tracker{display:flex;align-items:center;gap:10px;margin:12px 0 0;flex-wrap:wrap;font-size:12px;color:var(--edge2)}
+.tracker .bar{width:24px;height:1px;background:var(--edge2)}
+.tracker .bar.on{background:var(--muted)}
+.tracker .ph .n{display:none}
+.tracker .ph{color:var(--edge2)}
+.tracker .ph.on{color:var(--muted)}
+.tracker .ph.now{color:var(--text)}
+.tracker .ph.now::before{content:"● ";color:var(--accent);font-size:9px;vertical-align:1px;animation:pulse 1.2s infinite}
+@keyframes pulse{50%{opacity:.3}}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+.card{--c2:var(--c);--ground:var(--ink);position:relative;border:1px solid color-mix(in srgb,var(--c) 22%,var(--edge));padding:14px 14px 12px;min-height:150px;display:flex;flex-direction:column;gap:6px;transition:border-color .3s}
+.card .ttl{display:flex;gap:6px;font-size:12px}
 .card .ttl .name{color:var(--c)}
-.card .ttl .role{color:var(--muted);font-weight:500}
-.card.working{border-color:var(--c);animation:breathe 1.6s ease-in-out infinite}
-@keyframes breathe{50%{border-color:var(--c2)}}
-.card.error{border-color:var(--bad)}
-.card.error .ttl .name{color:var(--bad)}
-.card .head{display:flex;gap:16px;align-items:flex-start}
-.card .st{display:flex;flex-direction:column;gap:2px;min-width:0}
-.badge{align-self:flex-start;font-weight:800;padding:0 6px;background:var(--edge2);color:var(--soft);white-space:nowrap}
-.working .badge{background:var(--c);color:var(--ground)}
-.done .badge{background:var(--c);color:var(--ground)}
-.error .badge{background:var(--bad);color:#000}
+.card .ttl .role{color:var(--muted)}
+.card.working{border-color:color-mix(in srgb,var(--c) 45%,var(--edge))}
+.card.error{border-color:color-mix(in srgb,var(--bad) 45%,var(--edge))}
+.card .head{display:flex;gap:12px;align-items:center}
+.card .st{display:flex;flex-direction:column;min-width:0;font-size:12px}
+.badge{display:none}
 .stage{color:var(--soft)}
-.activity{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:1.55em}
-.track{height:1px;background:color-mix(in srgb,var(--c) 25%,var(--edge))}
-.working .track{background:linear-gradient(90deg,transparent,var(--c),var(--c2),transparent) color-mix(in srgb,var(--c) 25%,var(--edge));background-size:30% 100%;background-repeat:no-repeat;animation:comet 1.4s linear infinite;height:2px}
-.done .track{background:var(--c)}
-.error .track{background:var(--bad)}
-@keyframes comet{from{background-position:-30% 0}to{background-position:130% 0}}
-.body{color:var(--soft);max-height:230px;overflow:hidden;mask-image:linear-gradient(transparent,#000 20px);display:flex;flex-direction:column-reverse}
+.working .stage::before{content:"● ";color:var(--c);font-size:9px;vertical-align:1px;animation:pulse 1.2s infinite}
+.done .stage::before{content:"✓ ";color:var(--muted)}
+.error .stage::before{content:"✗ ";color:var(--bad)}
+.activity{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:1.6em}
+.track{display:none}
+.body{color:var(--soft);font-size:12.5px;max-height:220px;overflow:hidden;mask-image:linear-gradient(transparent,#000 20px);display:flex;flex-direction:column-reverse}
 .body .inner{padding-top:4px}
 .error .body{color:var(--bad)}
-.foot{position:absolute;bottom:-.8em;right:14px;padding:0 6px;background:var(--ground);color:var(--muted);font-size:12px;white-space:nowrap;display:flex;gap:6px;max-width:calc(100% - 28px)}
+.foot{margin-top:auto;color:var(--muted);font-size:11px;white-space:nowrap;display:flex;gap:6px;overflow:hidden}
 .foot .model{overflow:hidden;text-overflow:ellipsis}
 .foot span:empty{display:none}
-.foot .tok::before,.foot .time::before{content:"· ";color:var(--edge2)}
-.cursor{display:inline-block;width:.6em;height:1.1em;background:var(--c);vertical-align:-2px;margin-left:2px;animation:caret 1s steps(2) infinite}
+.foot .tok::before,.foot .time::before{content:"· "}
+.cursor{display:inline-block;width:.55em;height:1.05em;background:var(--c);vertical-align:-2px;margin-left:2px;animation:caret 1s steps(2) infinite;opacity:.7}
 @keyframes caret{50%{opacity:0}}
-/* Each agent's frame, as in the terminal: Claude rounded, Gemini double-lined, ChatGPT square, Qwen heavy */
-.card.b-claude,.verdict.b-claude{border-radius:9px}
-.card.b-gemini,.verdict.b-gemini{border:3px double var(--c)}
-.card.b-gemini.waiting{border-color:color-mix(in srgb,var(--c) 55%,var(--edge))}
-.card.b-qwen,.verdict.b-qwen{border-width:2px}
-.card.b-copilot,.verdict.b-copilot{border-radius:9px}
 .cards.solo{grid-template-columns:1fr}
 .cards.solo .card{min-height:0}
 .cards.solo .card .body{display:none}
 
-.verdict{--bc:var(--accent);margin-top:20px;display:none}
+.verdict{margin-top:22px;display:none;border-top:1px solid var(--edge);padding-top:16px}
 .verdict.show{display:block}
-.verdict .ttl{color:var(--text)}
-.verdict .drafting{color:var(--muted);font-weight:500;margin-left:8px}
-.verdict .text{line-height:1.65}
-.verdict.answer{border:1px solid var(--c);--ground:var(--ground-a)}
-.verdict.answer .ttl .name{color:var(--c)}
-.meter{display:flex;gap:28px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--edge2);font-weight:700;color:var(--muted);align-items:center}
-.meter .gauge{display:inline-flex;gap:2px;margin:0 10px;vertical-align:middle}
-.meter .gauge i{width:12px;height:4px;background:var(--edge2)}
-.meta{display:none}
-.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px;align-items:center}
-.btn{border:1px solid var(--edge2);background:var(--ink);padding:3px 11px;cursor:pointer;color:var(--soft)}
-.btn.primary{border-color:var(--accent);color:var(--text)}
-.applybox{display:inline-flex}
-.applybox .btn{border-right:0}
-.handoff,.problem{margin-top:22px}
-.problem{--bc:var(--bad)}
+.verdict .ttl{color:var(--muted);font-size:11px;letter-spacing:.08em;margin-bottom:10px;display:flex;gap:8px}
+.verdict .ttl .name{color:var(--c)}
+.verdict .sub{float:right;color:var(--muted);font-size:11px}
+.verdict .drafting{color:var(--muted)}
+.verdict .text{color:var(--text);line-height:1.7}
+.meter{display:flex;gap:24px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px;align-items:center}
+.meter .gauge{display:inline-flex;gap:2px;margin:0 8px;vertical-align:middle}
+.meter .gauge i{width:10px;height:3px;background:var(--edge2)}
+.actions{display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;align-items:center;font-size:12px}
+.btn{border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
+.btn:hover{color:var(--text)}
+.btn.primary{color:var(--soft)}
+.btn.primary::before{content:"→ ";color:var(--accent)}
+.applybox{display:inline-flex;gap:6px;align-items:baseline}
+.applybox select{color:var(--soft);border-bottom:1px dashed var(--edge2)}
+.handoff,.problem,.plan,.continue:not(:empty){margin-top:18px;font-size:12.5px}
+.handoff .ttl,.problem .ttl,.plan .ttl,.continue .ttl{display:block;color:var(--muted);font-size:11px;letter-spacing:.08em;margin-bottom:6px}
+.problem{border-left:1px solid var(--bad);padding-left:12px}
 .problem .ttl{color:var(--bad)}
-.fix{color:var(--accent);font-weight:700;margin-top:8px}
-.fix code{color:var(--text)}
+.continue .sub{display:none}
+.fix{color:var(--text);margin-top:6px}
 code,pre{font-family:var(--mono);font-size:12.5px}
-:not(pre)>code{color:var(--accent2)}
-pre{background:#050507;border:1px solid var(--edge2);padding:10px 12px;overflow:auto;white-space:pre-wrap}
-.text h3,.text h4,.text h5,.text h6,.body h3,.body h4,.body h5,.body h6{margin:12px 0 4px;font-size:13px;color:var(--text)}
+:not(pre)>code{color:var(--text)}
+pre{background:var(--panel);border:1px solid var(--edge);padding:10px 12px;overflow:auto;white-space:pre-wrap}
+.text h3,.text h4,.text h5,.text h6,.body h3,.body h4,.body h5,.body h6{margin:12px 0 4px;font-size:13px;font-weight:500;color:var(--text)}
 .text p{margin:8px 0}
-.text strong{color:var(--text)}
+.text strong{color:var(--text);font-weight:500}
 table{border-collapse:collapse;margin:8px 0}
-td,th{border:1px solid var(--edge2);padding:3px 8px;text-align:left}
-blockquote{margin:8px 0;padding-left:12px;border-left:1px solid var(--accent);color:var(--soft)}
-details.opinion{margin-top:12px;border:1px solid color-mix(in srgb,var(--c) 45%,var(--edge2));background:var(--ground,var(--ink))}
-details.opinion summary{cursor:pointer;padding:6px 12px;font-weight:700;color:var(--c)}
-details.opinion .text{padding:0 14px 12px}
-.continue{margin-top:22px}
-.continue .row{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 18px}
-.continue b{color:var(--c);cursor:pointer}
+td,th{border:1px solid var(--edge);padding:3px 8px;text-align:left;font-weight:400}
+blockquote{margin:8px 0;padding-left:12px;border-left:1px solid var(--edge2);color:var(--soft)}
+details.opinion{margin-top:8px}
+details.opinion summary{cursor:pointer;color:var(--muted);font-size:12px}
+details.opinion summary:hover{color:var(--c)}
+details.opinion .text{padding:6px 0 6px 14px;border-left:1px solid color-mix(in srgb,var(--c) 40%,var(--edge))}
+.continue .row{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 16px}
+.continue b{color:var(--c);cursor:pointer;font-weight:400}
 .continue code{color:var(--muted);cursor:pointer;overflow-wrap:anywhere}
 .continue code:hover{color:var(--text)}
-.plan{margin-top:20px}
-.plan .row{display:grid;grid-template-columns:22px 22px 120px 1fr;gap:8px;align-items:center;padding:2px 0;margin:0;color:var(--muted)}
-.plan .row b{color:var(--c)}
+.plan .row{display:grid;grid-template-columns:18px 18px 100px 1fr;gap:8px;align-items:center;padding:1px 0;margin:0;color:var(--muted)}
+.plan .row b{color:var(--c);font-weight:400}
 .plan .row.working{color:var(--text)}
 .plan .row.working .st{animation:spin 1s linear infinite;display:inline-block}
 .plan .row.done .st{color:var(--good)}
 .plan .row.error .st{color:var(--bad)}
 @keyframes spin{to{transform:rotate(360deg)}}
-
-.hello{padding:12px 0}
-.banner{display:inline-grid;gap:0;margin:6px 0 10px;line-height:0}
-.banner .r{display:flex}
-.banner .r i{display:block;width:8px;height:15px}
-.hello .line{margin:4px 0 18px}
-.hello .line b{color:var(--accent)}
-.council{display:grid;grid-template-columns:auto auto auto 1fr;gap:4px 22px;align-items:center}
-.council .who{display:flex;align-items:center;gap:8px;font-weight:800;color:var(--c)}
-.council .who .sprite{width:28px;height:24px}
-.council .ok{color:var(--good);font-weight:700}
-.council .no{color:var(--bad);font-weight:700}
-.council .fix{grid-column:1/-1;margin:0 0 4px 36px;font-weight:400;color:var(--soft)}
-.council .fix code{color:var(--accent)}
-.help{display:grid;grid-template-columns:auto 1fr;gap:3px 22px}
-.help b{color:var(--accent)}
-.sprite{width:66px;height:57px;flex:none;image-rendering:pixelated}
+.sprite{width:34px;height:29px;flex:none;image-rendering:pixelated;opacity:.9}
 .sprite svg{width:100%;height:100%;display:block;shape-rendering:crispEdges}
 .sprite .blink{opacity:0}
 .working .sprite{animation:bob .64s steps(2,jump-none) infinite}
 .working .sprite .blink{animation:wink 3.4s steps(1) infinite}
-@keyframes bob{50%{transform:translateY(-4px)}}
+@keyframes bob{50%{transform:translateY(-3px)}}
 @keyframes wink{0%,94%{opacity:0}95%,100%{opacity:1}}
-.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);border:1px solid var(--accent);padding:8px 14px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw}
+.card.waiting .sprite{opacity:.35;filter:grayscale(.6)}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--edge2);color:var(--text);padding:8px 14px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw;font-size:12px}
 .toast.show{opacity:1}
-.boot{position:fixed;inset:0;z-index:50;background:var(--ink);display:flex;align-items:center;justify-content:center;transition:opacity .45s}
-.boot pre{background:none;border:0;line-height:1.9;color:var(--accent);margin:0;min-width:min(520px,90vw)}
-.boot pre .ok{color:var(--good)}
-.boot pre .w{color:var(--text);font-weight:700}
-.boot.gone{opacity:0;pointer-events:none}
 main,.wrap,.run,.card{min-width:0}
 .body,.verdict .text,.handoff,.problem,.opinion .text{overflow-wrap:anywhere}
-@media (max-width:1050px){.cards{grid-template-columns:1fr!important}.app{grid-template-columns:1fr}aside{display:none}.app.sidebar aside{display:flex;max-height:55vh;border-right:0;border-bottom:1px solid var(--edge)}.modelgrid{grid-template-columns:1fr 1fr}}
-@media (max-width:720px){.tagline,.pills{display:none}header{gap:10px;padding:10px 14px}main{padding:12px}.runhead{flex-wrap:wrap}.banner .r i{width:4px;height:8px}
-.modelgrid{grid-template-columns:1fr}.go{margin-left:0;width:100%}}
+@media (max-width:1050px){.cards{grid-template-columns:1fr!important}.app{grid-template-columns:1fr}aside{display:none}.app.sidebar aside{display:flex;max-height:55vh;border-right:0;border-bottom:1px solid var(--edge)}}
+@media (max-width:720px){.pills{display:none}header{gap:12px;padding:10px 14px}main{padding:14px}.go{margin-left:0}}
 </style>
 </head>
 <body>
-<div class="boot" id="boot"><pre id="bootlog"></pre></div>
 <div class="app" id="app">
 <header>
-  <div class="logo"><i>■</i> CONCLAVE <span class="dim">//</span> <span id="minds">3 MINDS</span> <span class="dim" id="oneanswer">· ONE ANSWER</span></div>
-  <span class="tagline">SP_SYS // COUNCIL OS v__VERSION__</span>
+  <div class="logo">conclave<i>.</i></div>
+  <span class="dim" id="minds"></span>
   <div class="spacer"></div>
   <div class="pills" id="pills"></div>
   <select class="field" id="theme" title="Theme"></select>
   <button class="iconbtn" id="menu" title="Projects">☰</button>
-  <button class="iconbtn" id="quit" title="Stop Conclave">/exit</button>
+  <button class="iconbtn" id="quit" title="Stop Conclave">quit</button>
 </header>
 <aside>
-  <section class="panel frame">
-    <span class="ttl"><span class="br">[</span> PROJECTS <span class="br">]</span></span>
-    <input class="field" id="folder" placeholder="/project <path>  ↵">
+  <section>
+    <div class="label">projects</div>
+    <input class="field" id="folder" placeholder="paste a folder path ↵">
     <div class="list" id="projects" style="margin-top:8px"></div>
   </section>
-  <section class="panel frame">
-    <span class="ttl"><span class="br">[</span> CLAUDE CODE CONVERSATIONS <span class="br">]</span></span>
+  <section>
+    <div class="label">claude code conversations</div>
     <div class="list" id="convos"><div class="empty">Pick a project to see its conversations.</div></div>
   </section>
 </aside>
 <main>
   <div class="wrap">
     <div class="hello" id="hello">
-      <div class="banner" id="banner"></div>
-      <div class="line"><b>SP_SYS</b> <span class="dim">//</span> COUNCIL OS &nbsp; <span class="dim" id="hellominds">3 minds · one answer · claude leads</span></div>
-      <div class="panel brk"><span class="ttl"><span class="br">[</span> THE COUNCIL <span class="br">]</span></span><span class="sub">v__VERSION__</span>
-        <div class="council" id="council"></div></div>
+      <h1>conclave<i>.</i></h1>
+      <p id="hellominds">Claude leads, the advisers argue it out, and you get one answer. Or send a task to one agent.</p>
     </div>
-    <div class="panel brk composer" style="margin-top:14px">
-      <span class="ttl"><span class="br">[</span> <span id="brieftitle">ASK THE COUNCIL</span> <span class="br">]</span></span>
-      <span class="sub" id="destnote"></span>
+    <div class="composer">
       <div class="chips" id="context"></div>
-      <div class="sendto" id="sendto"></div>
-      <div class="lineup" id="lineup"></div>
-      <div class="prompt"><span class="tag">■ CONCLAVE</span><span id="ptags"></span><span class="arrow">❯</span>
-        <textarea id="question" placeholder="What should the council look at? For example: why does the build keep failing, and what's the fix?"></textarea></div>
+      <div class="tabs" id="sendto"></div>
+      <div class="tabs" id="lineup"></div>
+      <div class="models" id="models"></div>
+      <div class="prompt"><span id="ptags"></span><span class="arrow">❯</span>
+        <textarea id="question" placeholder="What should the council look at?"></textarea></div>
       <div class="row">
-        <button class="quick">Why does this keep failing, and what's the fix?</button>
-        <button class="quick">Review Claude's last change for bugs.</button>
-        <button class="quick">Is this the right approach? What would you do instead?</button>
-        <button class="quick">What should we try next?</button>
+        <button class="quick">why does this keep failing?</button>
+        <button class="quick">review Claude's last change for bugs</button>
+        <button class="quick">is this the right approach?</button>
+        <button class="quick">what should we try next?</button>
       </div>
       <div class="row">
-        <details class="models"><summary>models · timeout</summary>
-          <div class="modelgrid" id="modelgrid"></div>
-        </details>
         <span class="access" id="access" title="What a hand-off may do. The council itself always only reads."><span class="k">access</span><button data-level="read">read</button><button data-level="edit">edit</button><button data-level="full">full</button></span>
-        <label class="toggle council-only" title="Whether Claude may split a big task into subtasks for the agents best suited">split <select class="field" id="split"><option value="auto">auto</option><option value="always">always</option><option value="never">never</option></select></label>
-        <label class="toggle council-only" title="Advisers critique each other's opinions before Claude decides (slower, sharper)"><input type="checkbox" id="cross"> cross-exam</label>
-        <label class="toggle" title="Keep rounds as sessions you can continue in each agent's own tool"><input type="checkbox" id="save"> save sessions</label>
-        <button class="go" id="ask">Ask the council <kbd>⌘↵</kbd></button>
+        <details class="options"><summary>options</summary>
+          <div class="row">
+            <label class="toggle council-only" title="Whether Claude may split a big task into subtasks for the agents best suited">split <select class="field" id="split"><option value="auto">auto</option><option value="always">always</option><option value="never">never</option></select></label>
+            <label class="toggle council-only" title="Advisers critique each other's opinions before Claude decides (slower, sharper)"><input type="checkbox" id="cross"> cross-exam</label>
+            <label class="toggle" title="Keep rounds as sessions you can continue in each agent's own tool"><input type="checkbox" id="save"> save sessions</label>
+            <label class="toggle">timeout <input type="number" id="timeout" min="10">s</label>
+          </div>
+        </details>
+        <button class="go" id="ask">ask <kbd>⌘↵</kbd></button>
       </div>
     </div>
     <div id="runs"></div>
@@ -1019,23 +983,6 @@ function applyTheme(name) {
   store.set("theme", name);
 }
 
-function bootSequence() {
-  const box = $("#boot");
-  let seen = false; try { seen = sessionStorage.getItem("booted"); sessionStorage.setItem("booted", "1"); } catch {}
-  if (seen || matchMedia("(prefers-reduced-motion: reduce)").matches) { box.remove(); return; }
-  const members = ["claude", ...state.advisers].map(id => AG(id).name.toUpperCase()).join(" · ");
-  const online = ["claude", ...state.advisers].filter(id => AG(id).installed).length;
-  const lines = [["CONCLAVE // COUNCIL OS ", "OK"], ["MOUNTING CLAUDE CODE INDEX ... ", `${(state.projects || []).length} PROJECTS`],
-                 ["SEATING COUNCIL ... ", members], ["LINKING PROVIDERS ... ", `${online}/${state.advisers.length + 1} ONLINE`],
-                 ["OPERATOR ... ", "AUTHENTICATED"]];
-  let html = "", i = 0;
-  const step = () => {
-    if (i < lines.length) { html += `${esc(lines[i][0])}<span class="ok">${esc(lines[i][1])}</span>\n`; i++; $("#bootlog").innerHTML = html; setTimeout(step, 150); }
-    else { $("#bootlog").innerHTML = html + `<span class="w">&gt; WELCOME.</span>`; setTimeout(() => { box.classList.add("gone"); setTimeout(() => box.remove(), 500); }, 380); }
-  };
-  step();
-}
-
 async function boot() {
   state.info = await api("/api/info");
   const themes = $("#theme");
@@ -1050,13 +997,11 @@ async function boot() {
   state.access = store.get("access", "read"); if (state.access === "full") state.access = "read";  // full is asked for each visit
   $("#split").value = store.get("split", state.info.split);
   $("#split").onchange = () => store.set("split", $("#split").value);
-  renderCouncil(); drawBanner();
-  const saved = store.get("models", {});
-  $("#modelgrid").innerHTML = state.info.agents.map(p =>
-    `<label style="${vars(p.id)}"><span style="color:var(--c)">${esc(short(p.id))}</span><input class="field" data-model="${p.id}" placeholder="${esc(p.model || "default model")}" value="${esc(saved[p.id] || "")}"></label>`).join("")
-    + `<label>timeout (s)<input class="field" id="timeout" type="number" min="10" value="${store.get("timeout", state.info.timeout)}"></label>`;
-  $("#modelgrid").oninput = () => { const m = {}; document.querySelectorAll("[data-model]").forEach(e => m[e.dataset.model] = e.value.trim());
-    store.set("models", m); store.set("timeout", +$("#timeout").value || state.info.timeout); renderCouncil(); };
+  renderCouncil();
+  $("#timeout").value = store.get("timeout", state.info.timeout);
+  $("#timeout").oninput = () => store.set("timeout", +$("#timeout").value || state.info.timeout);
+  // Model suggestions come from each tool (agy models, ollama list…) and can take a moment, so they load after.
+  api("/api/models").then(m => { state.choices = m; renderCouncil(); }).catch(() => {});
   $("#save").checked = store.get("saveSessions", state.info.saveSessions);
   $("#cross").checked = store.get("crossExamine", state.info.crossExamine);
   $("#cross").onchange = () => store.set("crossExamine", $("#cross").checked);
@@ -1064,7 +1009,6 @@ async function boot() {
   document.querySelectorAll("#access button").forEach(b => b.onclick = () => setAccess(b.dataset.level));
   api("/api/health").then(report => { state.health = Object.fromEntries(report.map(h => [h.id, h])); renderCouncil(); }).catch(() => {});
   await loadProjects();
-  bootSequence();
   const last = store.get("project", null);
   const pick = last && state.projects.find(p => p.path === last) ? last : (state.projects.find(p => p.path === state.info.cwd) ? state.info.cwd : null);
   if (pick) selectProject(pick);
@@ -1079,66 +1023,60 @@ function setAccess(level) {
 }
 
 const modelOf = id => store.get("models", {})[id] || AG(id).model || "default model";
+const handle = id => AG(id).handle || id;
 
-// The header pills, the Send-to row, the council seats, the access switch and the button label.
+function setModel(id, value) {
+  const models = store.get("models", {}); models[id] = value.trim(); store.set("models", models);
+  renderPills();
+}
+
+function renderPills() {
+  const members = state.target ? [state.target] : ["claude", ...state.advisers], health = state.health || {};
+  $("#pills").innerHTML = members.map(id => { const a = AG(id), h = health[id] || {installed: a.installed};
+    const tip = !h.installed ? "not installed: " + (a.installCommand || a.install) : h.signedIn === false ? h.detail : `${h.version || a.cli} · ${a.strengths}`;
+    return `<div class="pill ${h.installed ? "" : "missing"}" style="${vars(id)}" title="${esc(tip)}"><i></i>${esc(handle(id))} <b>${esc(modelOf(id))}</b></div>`; }).join("");
+}
+
+// Who gets the message, who sits on the council, and which model each one runs.
 function renderCouncil() {
-  const members = ["claude", ...state.advisers], health = state.health || {};
-  $("#pills").innerHTML = (state.target ? [state.target] : members).map(id => { const a = AG(id), h = health[id] || {installed: a.installed};
-    const cls = !h.installed ? "missing" : h.signedIn === false ? "unsigned" : "";
-    const tip = !h.installed ? (a.installCommand || a.install) : h.signedIn === false ? h.detail : `${h.version || a.cli} · ${a.strengths}`;
-    return `<div class="pill ${cls}" style="${vars(id)}" title="${esc(tip)}"><i></i><b>${esc(short(id))}</b>${esc(modelOf(id))}</div>`; }).join("");
-  $("#sendto").innerHTML = `<span class="dim">send to</span><span class="dest council ${state.target ? "" : "on"}" data-dest="">■ COUNCIL</span>`
+  const members = ["claude", ...state.advisers];
+  renderPills();
+  const absent = a => a.installed ? "" : ` (not installed: ${a.installCommand || a.install})`;
+  $("#sendto").innerHTML = `<span class="k">send to</span><span class="dest council ${state.target ? "" : "on"}" data-dest="">council</span>`
     + state.info.agents.map(a => `<span class="dest ${state.target === a.id ? "on" : ""} ${a.installed ? "" : "absent"}" data-dest="${a.id}" style="${vars(a.id)}"
-      title="${esc(a.name + " · " + modelOf(a.id) + (a.installed ? "" : " · not installed: " + (a.installCommand || a.install)))}">${sprite(a.id, state.target === a.id ? "done" : "sleep")}${esc(short(a.id))}</span>`).join("");
+      title="${esc(a.name + absent(a))}">${esc(handle(a.id))}</span>`).join("");
   $("#sendto").querySelectorAll("[data-dest]").forEach(el => el.onclick = () => {
     state.target = el.dataset.dest || null; store.set("target", state.target);
     if (state.target && !AG(state.target).installed) toast(`${AG(state.target).name} isn't installed. In a terminal, run: ${AG(state.target).installCommand || AG(state.target).install}`);
     renderCouncil(); renderContext(); });
   $("#lineup").style.display = state.target ? "none" : "";
   document.querySelectorAll(".council-only").forEach(el => el.style.display = state.target ? "none" : "");
-  $("#lineup").innerHTML = `<span class="dim">council</span>` + state.info.agents.map(a => {
+  $("#lineup").innerHTML = `<span class="k">council</span>` + state.info.agents.map(a => {
     const seated = a.id === "claude" || state.advisers.includes(a.id);
     return `<span class="seat ${seated ? "on" : ""} ${a.installed ? "" : "absent"} ${a.id === "claude" ? "lead" : ""}" data-seat="${a.id}" style="${vars(a.id)}"
-      title="${esc(a.name + ": " + a.strengths + (a.installed ? "" : " · not installed: " + (a.installCommand || a.install)))}">${sprite(a.id, seated ? "done" : "sleep")}${esc(short(a.id))}</span>`; }).join("");
+      title="${esc((a.id === "claude" ? "leads · " : seated ? "click to unseat · " : "click to seat · ") + a.strengths + absent(a))}">${esc(handle(a.id))}</span>`; }).join("");
   $("#lineup").querySelectorAll("[data-seat]").forEach(el => el.onclick = () => {
     const id = el.dataset.seat; if (id === "claude") return;
     if (state.advisers.includes(id)) { if (state.advisers.length === 1) return toast("The council needs at least one adviser");
       state.advisers = state.advisers.filter(a => a !== id); }
     else { state.advisers = [...state.advisers, id]; if (!AG(id).installed) toast(`${AG(id).name} isn't installed. In a terminal, run: ${AG(id).installCommand || AG(id).install}`); }
     store.set("advisers", state.advisers); renderCouncil(); });
+  // One model field per agent in play: type any model, or pick one its tool offers.
+  const saved = store.get("models", {}), choices = state.choices || {};
+  $("#models").innerHTML = `<span class="k">models</span>` + (state.target ? [state.target] : members).map(id =>
+    `<label class="mdl" style="${vars(id)}" title="${esc(AG(id).name)}: type a model or pick one; leave it empty for ${esc(AG(id).model || "its default")}"><span>${esc(handle(id))}</span>`
+    + `<input data-model="${id}" list="models-${id}" value="${esc(saved[id] || "")}" placeholder="${esc(AG(id).model || "default")}" size="${Math.max(9, (saved[id] || AG(id).model || "default").length + 1)}">`
+    + `<datalist id="models-${id}">${(choices[id] || []).map(m => `<option value="${esc(m)}">`).join("")}</datalist></label>`).join("");
+  $("#models").querySelectorAll("[data-model]").forEach(el => {
+    el.oninput = () => { el.size = Math.max(9, (el.value || el.placeholder).length + 1); setModel(el.dataset.model, el.value); }; });
   const access = $("#access"); access.classList.toggle("off", !state.target);
-  access.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.level === (state.target ? state.access : "read")));
-  access.title = state.target ? state.info.access[state.access] : "The council always only reads. Pick one agent under Send to for edit or full access.";
-  $("#ask").innerHTML = (state.target ? `Send to ${esc(AG(state.target).name)}` : "Ask the council") + " <kbd>⌘↵</kbd>";
-  $("#brieftitle").textContent = state.target ? `ASK ${AG(state.target).name.toUpperCase()}` : "ASK THE COUNCIL";
-  $("#destnote").textContent = state.target ? `${state.access} access · ${modelOf(state.target)}` : `${members.length} minds · one answer · claude leads`;
-  $("#ptags").innerHTML = (state.target ? `<span class="tag to" style="${vars(state.target)}">→ ${esc(AG(state.target).handle.toUpperCase())}</span> ` : "")
-    + (state.target && state.access !== "read" ? `<span class="tag acc ${state.access}">${state.access.toUpperCase()}</span>` : "");
-  $("#oneanswer").style.display = state.target ? "none" : "";
-  $("#minds").textContent = state.target ? `→ ${AG(state.target).name.toUpperCase()}` : `${members.length} MINDS`;
-  const table = $("#council");
-  if (table) {
-    let rows = "";
-    const missing = [];
-    for (const id of members) { const a = AG(id), h = health[id] || {installed: a.installed};
-      if (!h.installed) missing.push(a);
-      rows += `<span class="who" style="${vars(id)}">${sprite(id, h.installed ? "done" : "sleep")}${esc(a.label)}</span><span class="dim">${id === "claude" ? "lead" : "adviser"}</span>
-        <span>${esc(modelOf(id))}</span>${!h.installed ? '<span class="no">✗ not installed</span>' : h.signedIn === false ? '<span class="no">✗ not signed in</span>' : '<span class="ok">● online</span>'}`; }
-    if (missing.length) rows += `<div class="fix">Not installed yet. In Terminal, run each line on its own:</div>` + missing.map(a =>
-      `<div class="fix"><code>${esc(a.installCommand || a.install)}</code></div>`).join("");
-    table.innerHTML = rows;
-  }
-}
-
-// The CONCLAVE banner, drawn in cells the way the terminal draws it, with the red full stop.
-function drawBanner() {
-  const lines = state.info.banner || [], width = Math.max(...lines.map(l => l.length));
-  const shade = i => { const t = i / Math.max(width - 1, 1), g = ["--g1", "--g2", "--g3"];
-    const a = t < .5 ? 0 : 1, f = t < .5 ? t * 2 : (t - .5) * 2;
-    return `color-mix(in srgb, var(${g[a]}) ${Math.round((1 - f) * 100)}%, var(${g[a + 1]}))`; };
-  $("#banner").innerHTML = lines.map((line, row) => `<div class="r">` + [...line.padEnd(width)].map((ch, i) =>
-    ch === "█" ? `<i style="background:${shade(i)}"></i>` : ch === " " ? "<i></i>" : `<i style="background:color-mix(in srgb, ${shade(i)} 28%, var(--ink))"></i>`).join("")
-    + `<i></i>` + [0, 1, 2].map(() => `<i style="${row === 3 || row === 4 ? "background:var(--accent)" : ""}"></i>`).join("") + `</div>`).join("");
+  access.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.level === state.access));
+  access.title = state.info.access[state.access];
+  $("#ask").innerHTML = (state.target ? `send to ${esc(handle(state.target))}` : "ask") + " <kbd>⌘↵</kbd>";
+  $("#question").placeholder = state.target ? `What should ${AG(state.target).name} do?` : "What should the council look at?";
+  $("#ptags").innerHTML = (state.target ? `<span class="tag to" style="${vars(state.target)}">${esc(handle(state.target))}</span> ` : "")
+    + (state.target && state.access !== "read" ? `<span class="tag acc ${state.access}">${state.access}</span> ` : "");
+  $("#minds").textContent = state.target ? `→ ${handle(state.target)}` : `${members.length} minds · one answer`;
 }
 
 async function loadProjects() {
@@ -1190,7 +1128,7 @@ function renderContext() {
 
 function card(name, role) {
   return `<div class="card waiting b-${name}" data-name="${name}" style="${vars(name)}">
-    <span class="ttl"><span class="name">${esc(AG(name).label)}</span> <span class="role">· ${esc(role)}</span></span>
+    <div class="ttl"><span class="name">${esc(handle(name))}</span><span class="role">${esc(role)}</span></div>
     <div class="head">${sprite(name, "sleep")}<div class="st"><span class="badge">STANDBY</span><span class="stage">standing by</span><span class="activity"></span></div></div>
     <div class="track"></div>
     <div class="body"><div class="inner"></div></div>
@@ -1213,25 +1151,22 @@ async function ask(opts = {}) {
   $("#hello")?.remove(); if (!opts.question) $("#question").value = "";
   const conv = state.convos.find(c => c.id === state.conversation);
   const el = document.createElement("section"); el.className = "run";
-  const phases = agent ? [["solo", `${AG(agent).name.toUpperCase()} · HAND-OFF · ${access.toUpperCase()}`]] : phaseList(cross);
+  const phases = agent ? [["solo", `${handle(agent)} · ${access} access`]] : phaseList(cross);
   const members = agent ? [agent] : ["claude", ...advisers];
-  const head = agent ? `<span style="color:var(--${agent})">→</span> ${esc(AG(agent).label.replace(/^\S+\s+/, ""))} <span class="dim">// ${access.toUpperCase()} ACCESS</span>`
-    : `<span class="br">■</span> CONCLAVE <span class="dim">// ${members.length} MINDS · ONE ANSWER</span>`;
-  el.innerHTML = `<div class="panel brk"><span class="ttl">${head}</span><span class="sub"><span class="clock">⏱ 0:00</span></span>
-    <div class="runhead"><h2>${esc(question)}</h2><button class="btn" data-act="cancel">cancel</button></div>
-    <div class="chips" style="margin-top:6px">${state.project ? `<span class="chip">⌂ <span>${esc(state.project.split("/").pop())}</span></span>` : ""}${conv && !opts.apply ? `<span class="chip">❝ <span>${esc(conv.title)}</span></span>` : ""}</div>
-    <div class="tracker">${trackerHTML(phases)}</div></div>
+  el.innerHTML = `<div class="runhead"><h2>${esc(question)}</h2><span class="clock">0:00</span><button class="btn" data-act="cancel">cancel</button></div>
+    <div class="runmeta">${agent ? `<span style="color:var(--${agent})">→ ${esc(handle(agent))}</span>` : `<span>council · ${members.length} minds</span>`}${state.project ? `<span>⌂ ${esc(state.project.split("/").pop())}</span>` : ""}${conv && !opts.apply ? `<span>❝ ${esc(conv.title)}</span>` : ""}</div>
+    <div class="tracker">${trackerHTML(phases)}</div>
     <div class="planbox"></div>
-    <div class="cards ${agent ? "solo" : ""}" style="${agent ? "" : `grid-template-columns:repeat(${Math.min(members.length, 4)},1fr)`}">${members.map(n => card(n, agent ? "HAND-OFF" : n === "claude" ? "LEAD" : "ADVISER")).join("")}</div>
+    <div class="cards ${agent ? "solo" : ""}" style="${agent ? "" : `grid-template-columns:repeat(${Math.min(members.length, 4)},1fr)`}">${members.map(n => card(n, agent ? "" : n === "claude" ? "lead" : "adviser")).join("")}</div>
     <div class="problems"></div>
-    <div class="panel verdict ${agent ? `answer b-${agent}` : "brk"}" style="${agent ? vars(agent) + `;--ground-a:${AG(agent).style?.ground || "var(--ink)"}` : ""}"><span class="ttl">${agent ? `<span class="name">${esc(AG(agent).label)}</span> · ANSWER` : bracket("VERDICT")}<span class="drafting">${agent ? "working…" : "drafting…"}</span></span><span class="sub"></span><div class="text"></div><div class="meterbox"></div></div>
+    <div class="verdict" style="${agent ? vars(agent) : "--c:var(--accent)"}"><span class="sub"></span><div class="ttl">${agent ? `<span class="name">${esc(handle(agent))}</span> answer` : "verdict"}<span class="drafting">${agent ? "· working…" : "· drafting…"}</span></div><div class="text"></div><div class="meterbox"></div></div>
     <div class="actions"></div><div class="continue"></div><div class="opinions"></div>`;
   $("#runs").prepend(el);
   follow(id, el, question, phases, agent);
 }
 
-const phaseList = cross => [["brief", "BRIEF"], ["advise", "DELIBERATION"], ...(cross ? [["cross", "CROSS-EXAM"]] : []), ["verdict", "VERDICT"]];
-const SPLIT_PHASES = [["brief", "PLAN"], ["work", "SUBTASKS"], ["verdict", "VERDICT"]];
+const phaseList = cross => [["brief", "brief"], ["advise", "deliberation"], ...(cross ? [["cross", "cross-exam"]] : []), ["verdict", "verdict"]];
+const SPLIT_PHASES = [["brief", "plan"], ["work", "subtasks"], ["verdict", "verdict"]];
 const trackerHTML = list => list.map(([k, label], i) => `${i ? '<span class="bar"></span>' : ""}<span class="ph" data-ph="${k}"><span class="n">${String(i + 1).padStart(2, "0")}</span>${label}</span>`).join("");
 
 function follow(id, el, question, phaseDefs, agent) {
@@ -1239,7 +1174,7 @@ function follow(id, el, question, phaseDefs, agent) {
   const speaker = agent || "claude";
   const cardEl = n => el.querySelector(`.card[data-name="${n}"]`);
   const tick = setInterval(() => {
-    if (!run.done) el.querySelector(".clock").textContent = "⏱ " + clock((Date.now() - run.started) / 1000);
+    if (!run.done) el.querySelector(".clock").textContent = clock((Date.now() - run.started) / 1000);
     for (const [n, c] of Object.entries(run.cards)) if (c.start && !c.end) cardEl(n).querySelector(".time").textContent = clock((Date.now() - c.start) / 1000);
   }, 250);
   let phases = [...phaseDefs.map(p => p[0]), "done"];
@@ -1255,12 +1190,12 @@ function follow(id, el, question, phaseDefs, agent) {
     if (e.type === "phase") setPhase(e.phase);
     if (e.type === "mode" && e.mode === "split") { phases = [...SPLIT_PHASES.map(p => p[0]), "done"];
       el.querySelector(".tracker").innerHTML = trackerHTML(SPLIT_PHASES); setPhase(run.phase); }
-    if (e.type === "plan") el.querySelector(".planbox").innerHTML = `<div class="panel brk plan"><span class="ttl">${bracket("CLAUDE'S PLAN")}</span>` + e.subtasks.map((t, i) =>
+    if (e.type === "plan") el.querySelector(".planbox").innerHTML = `<div class="plan"><span class="ttl">claude's plan</span>` + e.subtasks.map((t, i) =>
       `<div class="row" data-sub="${i}" style="${vars(t.agent)}"><span>${i + 1}</span><span class="st">○</span><b>${esc(short(t.agent))}</b><span>${esc(t.title)}</span></div>`).join("") + "</div>";
     if (e.type === "subtask") { const row = el.querySelector(`[data-sub="${e.index}"]`);
       if (row) { row.className = "row " + e.status; row.querySelector(".st").textContent = {working: "◌", done: "✓", error: "✗"}[e.status] || "○"; row.title = e.preview || ""; } }
     if (!c) { if (["done", "cancelled", "failed"].includes(e.type)) end(e); return; }
-    if (e.type === "start") { run.cards[e.name] = {start: Date.now()}; c.className = `card working b-${e.name}`; c.querySelector(".badge").textContent = "▸ ACTIVE"; mood(e.name, "working");
+    if (e.type === "start") { run.cards[e.name] = {start: Date.now()}; c.className = `card working b-${e.name}`; c.querySelector(".badge").textContent = "active"; mood(e.name, "working");
       c.querySelector(".stage").textContent = e.stage; c.querySelector(".activity").textContent = e.activity || "";
       c.querySelector(".inner").innerHTML = e.preview ? md(e.preview) : ""; }
     if (e.type === "stream") {
@@ -1270,7 +1205,7 @@ function follow(id, el, question, phaseDefs, agent) {
       else { c.querySelector(".inner").innerHTML = md(e.name === "claude" ? drafting(e.text) : e.text) + '<span class="cursor"></span>';
         if (!run.tokens[e.name] && e.text) c.querySelector(".tok").textContent = "~" + count(Math.round(e.text.length / 4)) + " tok"; } }
     if (e.type === "finish") { if (run.cards[e.name]) run.cards[e.name].end = Date.now(); c.className = `card ${e.status} b-${e.name}`; mood(e.name, e.status);
-      c.querySelector(".badge").textContent = {done: "✓ DONE", error: "✗ FAULT"}[e.status] || "STANDBY"; c.querySelector(".stage").textContent = e.stage;
+      c.querySelector(".badge").textContent = {done: "done", error: "fault"}[e.status] || "standby"; c.querySelector(".stage").textContent = e.stage;
       c.querySelector(".activity").textContent = ""; c.querySelector(".inner").innerHTML = e.status === "error" ? `<span class="err">${esc(e.preview)}</span>` : md(e.preview); }
     if (e.type === "tokens") { const t = run.tokens[e.name] || [0, 0]; run.tokens[e.name] = [t[0] + e.in, t[1] + e.out];
       c.querySelector(".tok").textContent = `↑${count(run.tokens[e.name][0])} ↓${count(run.tokens[e.name][1])}`; }
@@ -1285,11 +1220,11 @@ function follow(id, el, question, phaseDefs, agent) {
 
 function finish(el, e, question) {
   const actions = el.querySelector(".actions"), problems = el.querySelector(".problems");
-  const problem = (title, body) => `<div class="panel brk problem"><span class="ttl">${bracket("FAULT")} ${title}</span>${body}</div>`;
-  if (e.type === "cancelled") { problems.innerHTML = problem("CANCELLED", "The model calls were stopped."); return; }
-  if (e.type === "failed") { problems.innerHTML = problem("SOMETHING WENT WRONG", esc(e.message)); return; }
+  const problem = (title, body) => `<div class="problem"><span class="ttl">${title}</span>${body}</div>`;
+  if (e.type === "cancelled") { problems.innerHTML = problem("cancelled", "The model calls were stopped."); return; }
+  if (e.type === "failed") { problems.innerHTML = problem("something went wrong", esc(e.message)); return; }
   const r = e.result, solo = r.mode === "solo";
-  problems.innerHTML = r.errors.map(x => problem(esc(x.headline), `<div style="white-space:pre-wrap">${esc(x.message)}</div>${x.fix ? `<div class="fix">→ ${inline(x.fix)}</div>` : ""}`)).join("");
+  problems.innerHTML = r.errors.map(x => problem(esc(x.headline.toLowerCase()), `<div style="white-space:pre-wrap">${esc(x.message)}</div>${x.fix ? `<div class="fix">→ ${inline(x.fix)}</div>` : ""}`)).join("");
   if (!r.final) { el.querySelector(".verdict").classList.remove("show"); return; }
   if (solo && r.thread) { state.threads[r.speaker] = r.thread; renderContext(); }
   const v = el.querySelector(".verdict"); v.classList.add("show"); v.querySelector(".drafting").remove();
@@ -1298,13 +1233,13 @@ function finish(el, e, question) {
   const levels = {strong: [11, "var(--good)"], partial: [7, "var(--warn)"], split: [3, "var(--bad)"]}, dots = {high: 3, medium: 2, low: 1};
   let meter = "";
   if (r.agreement) { const [n, col] = levels[r.agreement];
-    meter += `<span>AGREEMENT<span class="gauge">${Array.from({length: 12}, (_, i) => `<i style="${i < n ? `background:${col}` : ""}"></i>`).join("")}</span><b style="color:${col}">${r.agreement}</b></span>`; }
+    meter += `<span>agreement<span class="gauge">${Array.from({length: 12}, (_, i) => `<i style="${i < n ? `background:${col}` : ""}"></i>`).join("")}</span><b style="color:${col};font-weight:400">${r.agreement}</b></span>`; }
   if (r.confidence) { const n = dots[r.confidence];
-    meter += `<span>CONFIDENCE<span class="gauge">${[0, 1, 2].map(i => `<i style="width:8px;height:8px;${i < n ? "background:var(--accent)" : ""}"></i>`).join("")}</span><b style="color:var(--accent)">${r.confidence}</b></span>`; }
+    meter += `<span>confidence<span class="gauge">${[0, 1, 2].map(i => `<i style="width:6px;height:6px;border-radius:50%;${i < n ? "background:var(--soft)" : ""}"></i>`).join("")}</span><b style="color:var(--soft);font-weight:400">${r.confidence}</b></span>`; }
   v.querySelector(".meterbox").innerHTML = (meter ? `<div class="meter">${meter}</div>` : "") + "";
   const applyChoices = state.info.agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join("");
-  actions.innerHTML = (solo ? "" : `<span class="applybox"><button class="btn primary" data-act="apply" title="Have an agent make these changes in the project, at edit access (or full, if you chose it)">/apply with</button><select class="field" data-act="applyto">${applyChoices}</select></span>`)
-    + `<button class="btn ${solo ? "primary" : ""}" data-act="handoff">/handoff to Claude Code</button><button class="btn" data-act="copy">copy</button>
+  actions.innerHTML = (solo ? "" : `<span class="applybox"><button class="btn primary" data-act="apply" title="Have an agent make these changes in the project, at edit access (or full, if you chose it)">apply with</button><select class="field" data-act="applyto">${applyChoices}</select></span>`)
+    + `<button class="btn ${solo ? "primary" : ""}" data-act="handoff">hand back to Claude Code</button><button class="btn" data-act="copy">copy</button>
     <button class="btn" data-act="follow">${solo ? `carry on with ${esc(AG(r.speaker).name)}` : "ask a follow-up"}</button>`;
   actions.querySelector('[data-act="copy"]').onclick = () => navigator.clipboard.writeText(r.final).then(() => toast("Copied"));
   actions.querySelector('[data-act="follow"]').onclick = () => {
@@ -1317,16 +1252,15 @@ function finish(el, e, question) {
     ask({question: `Apply: ${question}`, agent: to, access, apply: el.dataset.run}); };
   actions.querySelector('[data-act="handoff"]').onclick = async () => {
     try { const h = await api(`/api/runs/${el.dataset.run}/handoff`, {});
-      let box = el.querySelector(".handoff"); if (!box) { box = document.createElement("div"); box.className = "panel brk handoff"; actions.after(box); }
-      box.innerHTML = `<span class="ttl">${bracket("HAND BACK TO CLAUDE CODE")}</span>Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue the Claude Code conversation with it:<pre>${esc(h.command)}</pre>`;
+      let box = el.querySelector(".handoff"); if (!box) { box = document.createElement("div"); box.className = "handoff"; actions.after(box); }
+      box.innerHTML = `<span class="ttl">hand back to claude code</span>Saved <code>${esc(h.path)}</code>. Run this in Terminal to continue the Claude Code conversation with it:<pre>${esc(h.command)}</pre>`;
       navigator.clipboard.writeText(h.command).then(() => toast("Command copied — paste it in Terminal"), () => {});
     } catch (err) { toast(err.message); } };
   const saved = Object.keys(r.sessions || {});
   const cont = el.querySelector(".continue");
   if (saved.length) {
-    cont.className = "continue panel brk";
-    cont.innerHTML = `<span class="ttl">${bracket("CONTINUE IN EACH MODEL'S OWN TOOL")}</span><span class="sub">click one to open it</span><div class="row">` + saved.map(n =>
-      `<b style="${vars(n)}" data-tool="${n}">${esc(AG(n).label.split(" ")[0])} ${esc(AG(n).name)}</b><code data-tool="${n}">${esc(r.sessions[n])}</code>`).join("") + "</div>";
+    cont.innerHTML = `<span class="ttl">continue in each tool · click to open</span><div class="row">` + saved.map(n =>
+      `<b style="${vars(n)}" data-tool="${n}">${esc(AG(n).name)}</b><code data-tool="${n}">${esc(r.sessions[n])}</code>`).join("") + "</div>";
     cont.querySelectorAll("[data-tool]").forEach(b => b.onclick = async () => {
       try { const res = await api(`/api/runs/${el.dataset.run}/continue`, {provider: b.dataset.tool});
         if (res.opened) toast(`Opened in Terminal: ${AG(b.dataset.tool).name}`);
@@ -1334,8 +1268,8 @@ function finish(el, e, question) {
       } catch (err) { toast(err.message); } });
   }
   const split = r.mode === "split";
-  el.querySelector(".opinions").innerHTML = solo ? "" : [["brief", "claude", split ? "■ CLAUDE · PLAN" : "■ CLAUDE · BRIEF", r.brief],
-    ...Object.entries(r.opinions).map(([n, t]) => [n, n, `${AG(n).label} · ${split ? "SUBTASKS" : "OPINION"}`, t])]
+  el.querySelector(".opinions").innerHTML = solo ? "" : [["brief", "claude", split ? "claude's plan" : "claude's brief", r.brief],
+    ...Object.entries(r.opinions).map(([n, t]) => [n, n, `${handle(n)}'s ${split ? "subtasks" : "opinion"}`, t])]
     .filter(x => x[3]).map(([, n, title, t]) => `<details class="opinion" style="${vars(n)}"><summary>${esc(title)}</summary><div class="text">${md(t)}</div></details>`).join("");
   if (!solo) { state.history.push([question, r.final]); renderContext(); }
 }
